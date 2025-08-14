@@ -30,6 +30,12 @@ const app = express();
 app.use(helmet());
 app.use(compression());
 app.set("trust proxy", 1);
+app.use((req, res, next) => {
+  if (process.env.NODE_ENV === 'production' && req.headers['x-forwarded-proto'] !== 'https') {
+    return res.redirect('https://' + req.headers.host + req.url);
+  }
+  next();
+});
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per windowMs
@@ -960,10 +966,9 @@ app.get('/api/performance', (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+
 
 // Performance optimization: Add database indexes for faster queries
 const setupDatabaseIndexes = async () => {
