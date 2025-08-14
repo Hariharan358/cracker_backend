@@ -32,12 +32,7 @@ console.log("ENV Vars:", process.env);
 app.use(helmet());
 app.use(compression());
 app.set("trust proxy", 1);
-app.use((req, res, next) => {
-  if (process.env.NODE_ENV === 'production' && req.headers['x-forwarded-proto'] !== 'https') {
-    return res.redirect('https://' + req.headers.host + req.url);
-  }
-  next();
-});
+
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per windowMs
