@@ -27,6 +27,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+console.log("ENV Vars:", process.env);
+
 app.use(helmet());
 app.use(compression());
 app.set("trust proxy", 1);
