@@ -1,0 +1,21 @@
+{
+    "name": "my-backend",
+    "version": "1.0.0",
+    "main": "server.js",
+    "type": "module",
+    "scripts": {
+      "start": "node server.js"
+    },
+    "dependencies": {
+      "express": "^5.1.0",
+      "mongoose": "^8.17.1",
+      "cors": "^2.8.5",
+      "dotenv": "^17.2.1",
+      "compression": "^1.8.1",
+      "helmet": "^8.1.0",
+      "cloudinary": "^1.41.3",
+      "multer": "^2.0.2",
+      "multer-storage-cloudinary": "^4.0.0"
+    }
+  }
+  
