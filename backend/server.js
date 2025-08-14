@@ -27,12 +27,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-console.log("ENV Vars:", process.env);
 
-app.use(helmet());
+// Configure Helmet with CORS-friendly settings
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  crossOriginEmbedderPolicy: false
+}));
+
 app.use(compression());
-app.set("trust proxy", 1);
-
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per windowMs
@@ -40,10 +42,57 @@ const limiter = rateLimit({
   legacyHeaders: false,
 });
 app.use(limiter);
-app.use(cors());
+// Configure CORS to allow requests from your frontend domain
+const corsOptions = {
+  origin: [
+    'https://www.kmpyrotech.com',
+    'https://kmpyrotech.com',
+    'http://localhost:3000',
+    'http://localhost:5173'
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+};
 
+console.log('🌐 CORS Configuration:', corsOptions);
+app.use(cors(corsOptions));
 
+// Handle preflight requests
+app.options('*', cors());
 
+// Add additional CORS headers middleware
+app.use((req, res, next) => {
+  // Log CORS-related requests for debugging
+  console.log(`🌐 CORS Request: ${req.method} ${req.path} from origin: ${req.headers.origin}`);
+  
+  // Check if origin is in allowed list
+  const allowedOrigins = [
+    'https://www.kmpyrotech.com',
+    'https://kmpyrotech.com',
+    'http://localhost:3000',
+    'http://localhost:5173'
+  ];
+  
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    console.log(`✅ Origin allowed: ${origin}`);
+  } else {
+    console.log(`⚠️ Origin not in allowed list: ${origin}`);
+  }
+  
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  
+  if (req.method === 'OPTIONS') {
+    console.log('✅ Preflight request handled');
+    res.sendStatus(200);
+  } else {
+    next();
+  }
+});
 app.use(express.json());
 const cache = apicache.middleware;
 
@@ -945,6 +994,26 @@ app.use((req, res, next) => {
   next();
 });
 
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('❌ Server error:', err);
+  
+  // Handle CORS errors specifically
+  if (err.message && err.message.includes('CORS')) {
+    console.error('🌐 CORS Error Details:', {
+      origin: req.headers.origin,
+      method: req.method,
+      path: req.path,
+      userAgent: req.headers['user-agent']
+    });
+  }
+  
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+  });
+});
+
 // ✅ GET: Performance metrics
 app.get('/api/performance', (req, res) => {
   res.json({
@@ -960,9 +1029,40 @@ app.get('/api/performance', (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+// ✅ Health check endpoint for Railway
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    cors: 'enabled',
+    allowedOrigins: [
+      'https://www.kmpyrotech.com',
+      'https://kmpyrotech.com',
+      'http://localhost:3000',
+      'http://localhost:5173'
+    ]
+  });
+});
 
+// ✅ Test CORS endpoint
+app.get('/api/test-cors', (req, res) => {
+  console.log('🧪 Test CORS endpoint called');
+  console.log('📋 Request headers:', req.headers);
+  res.json({
+    message: 'CORS test successful',
+    timestamp: new Date().toISOString(),
+    origin: req.headers.origin,
+    method: req.method
+  });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`🚀 Server is running on port ${PORT}`);
+  console.log(`🌐 CORS enabled for origins: https://www.kmpyrotech.com, https://kmpyrotech.com`);
+  console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📊 Railway deployment: ${process.env.RAILWAY_ENVIRONMENT ? 'Yes' : 'No'}`);
+});
 
 // Performance optimization: Add database indexes for faster queries
 const setupDatabaseIndexes = async () => {
