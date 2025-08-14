@@ -9,16 +9,47 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
+     "apicache": "^1.6.3",
+    "axios": "^1.10.0",
+    "class-variance-authority": "^0.7.1",
     "cloudinary": "^1.41.3",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.0.0",
     "compression": "^1.8.1",
     "cors": "^2.8.5",
+    "date-fns": "^3.6.0",
     "dotenv": "^17.2.1",
+    "embla-carousel-react": "^8.3.0",
     "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
+    "firebase": "^10.14.1",
+    "firebase-admin": "^12.7.0",
+    "framer-motion": "^12.23.6",
+    "fs": "^0.0.1-security",
     "helmet": "^8.1.0",
+    "input-otp": "^1.2.4",
+    "lucide-react": "^0.462.0",
     "mongoose": "^8.17.1",
     "multer": "^2.0.2",
     "multer-storage-cloudinary": "^4.0.0",
-    "pdfkit": "^0.17.1"
+    "next-themes": "^0.3.0",
+    "nodemailer": "^7.0.5",
+    "path": "^0.12.7",
+    "pdfkit": "^0.17.1",
+    "react": "^18.3.1",
+    "react-day-picker": "^8.10.1",
+    "react-dom": "^18.3.1",
+    "react-hook-form": "^7.53.0",
+    "react-icons": "^5.5.0",
+    "react-resizable-panels": "^2.1.3",
+    "react-router-dom": "^6.26.2",
+    "recharts": "^2.12.7",
+    "sonner": "^1.5.0",
+    "tailwind-merge": "^2.5.2",
+    "tailwindcss-animate": "^1.0.7",
+    "twilio": "^5.8.0",
+    "vaul": "^0.9.3",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
@@ -27,5 +58,6 @@
     "node": ">=18.x"
   }
 }
+
 
 
