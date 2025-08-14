@@ -27,11 +27,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-
 app.use(helmet());
 app.use(compression());
 app.set("trust proxy", 1);
-
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per windowMs
@@ -604,6 +602,10 @@ app.get('/api/analytics', cache('2 minutes'), async (req, res) => {
 });
 
 // ✅ PATCH: Update Order Status and Transport Details
+// Order Status Flow: confirmed → payment_verified → booked
+// - confirmed: Order placed, waiting for payment verification
+// - payment_verified: Payment screenshot verified by admin  
+// - booked: Order booked for delivery with transport details
 app.patch('/api/orders/update-status/:orderId', async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -694,20 +696,80 @@ app.patch('/api/orders/update-status/:orderId', async (req, res) => {
   }
 });
 
-// ✅ GET: Products by Category
+// ✅ GET: Home Page Products (Optimized for first impression)
+app.get('/api/products/home', cache('3 minutes'), async (req, res) => {
+  try {
+    // Prioritize Atom Bomb and Sparkler products for home page
+    const featuredCategories = ['ATOM_BOMB', 'SPARKLER_ITEMS'];
+    
+    // Fetch products in parallel with limited results for faster loading
+    const homeProducts = await Promise.all(
+      featuredCategories.map(async (category) => {
+        try {
+          const ProductModel = getProductModelByCategory(category);
+          // Use lean() for faster plain objects, limit to 6 products per category for better display
+          const products = await ProductModel.find({}, {
+            name_en: 1,
+            name_ta: 1,
+            price: 1,
+            original_price: 1,
+            imageUrl: 1,
+            youtube_url: 1,
+            category: 1
+          }).limit(6).lean();
+          
+          // Add category name for frontend
+          return products.map(product => ({
+            ...product,
+            category: category.replace(/_/g, ' ')
+          }));
+        } catch (err) {
+          console.warn(`⚠️ Warning: Could not fetch products for category ${category}:`, err.message);
+          return [];
+        }
+      })
+    );
+
+    // Flatten and return home page products
+    const allHomeProducts = homeProducts.flat();
+    res.json(allHomeProducts);
+  } catch (error) {
+    console.error('❌ Error fetching home page products:', error);
+    res.status(500).json({ error: 'Failed to fetch home page products' });
+  }
+});
+
+// ✅ GET: Products by Category (Optimized)
 app.get('/api/products/category/:category', cache('2 minutes'), async (req, res) => {
   try {
     const category = req.params.category;
     const ProductModel = getProductModelByCategory(category);
-    const products = await ProductModel.find();
-    res.json(products);
+    
+    // Use lean() for faster plain objects, project only needed fields
+    const products = await ProductModel.find({}, {
+      name_en: 1,
+      name_ta: 1,
+      price: 1,
+      original_price: 1,
+      imageUrl: 1,
+      youtube_url: 1,
+      category: 1
+    }).lean();
+    
+    // Add category name for frontend
+    const productsWithCategory = products.map(product => ({
+      ...product,
+      category: category.replace(/_/g, ' ')
+    }));
+    
+    res.json(productsWithCategory);
   } catch (error) {
     console.error('❌ Error fetching category products:', error);
     res.status(500).json({ error: 'Failed to fetch products by category' });
   }
 });
 
-// ✅ GET: All Products across all categories (cached)
+// ✅ GET: All Products across all categories (Optimized with better caching)
 app.get('/api/products/all', cache('5 minutes'), async (req, res) => {
   try {
     const collections = await mongoose.connection.db.listCollections().toArray();
@@ -715,21 +777,27 @@ app.get('/api/products/all', cache('5 minutes'), async (req, res) => {
       .map((c) => c.name)
       .filter((name) => /^[A-Z0-9_]+$/.test(name));
 
-    // Fetch all collections in parallel and attach category field
+    // Fetch all collections in parallel with optimized queries
     const allProductsArrays = await Promise.all(
       categoryCollectionNames.map(async (collectionName) => {
-        const Model = mongoose.model(collectionName, productSchema, collectionName);
-        // lean() for faster plain objects; project only needed fields
-        const docs = await Model.find({}, {
-          name_en: 1,
-          name_ta: 1,
-          price: 1,
-          original_price: 1,
-          imageUrl: 1,
-          youtube_url: 1,
-        }).lean();
-        const category = collectionName.replace(/_/g, ' ');
-        return docs.map((doc) => ({ ...doc, category }));
+        try {
+          const Model = mongoose.model(collectionName, productSchema, collectionName);
+          // Use lean() for faster plain objects, project only needed fields
+          const docs = await Model.find({}, {
+            name_en: 1,
+            name_ta: 1,
+            price: 1,
+            original_price: 1,
+            imageUrl: 1,
+            youtube_url: 1,
+          }).lean();
+          
+          const category = collectionName.replace(/_/g, ' ');
+          return docs.map((doc) => ({ ...doc, category }));
+        } catch (err) {
+          console.warn(`⚠️ Warning: Could not fetch products for collection ${collectionName}:`, err.message);
+          return [];
+        }
       })
     );
 
@@ -861,7 +929,63 @@ app.get('/api/notifications/tokens-count', (req, res) => {
   res.json({ count: fcmTokens.size });
 });
 
+// Performance monitoring middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`📊 ${req.method} ${req.path} - ${res.statusCode} - ${duration}ms`);
+  });
+  next();
+});
+
+// ✅ GET: Performance metrics
+app.get('/api/performance', (req, res) => {
+  res.json({
+    status: 'Server running',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    endpoints: {
+      home: '/api/products/home - Optimized for first impression',
+      category: '/api/products/category/:category - Optimized with lean queries',
+      all: '/api/products/all - Optimized with parallel fetching'
+    }
+  });
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
+});
+
+// Performance optimization: Add database indexes for faster queries
+const setupDatabaseIndexes = async () => {
+  try {
+    const collections = await mongoose.connection.db.listCollections().toArray();
+    const categoryCollectionNames = collections
+      .map((c) => c.name)
+      .filter((name) => /^[A-Z0-9_]+$/.test(name));
+
+    // Create indexes for each category collection
+    for (const collectionName of categoryCollectionNames) {
+      try {
+        const collection = mongoose.connection.db.collection(collectionName);
+        await collection.createIndex({ name_en: 1 });
+        await collection.createIndex({ category: 1 });
+        await collection.createIndex({ price: 1 });
+        console.log(`✅ Indexes created for collection: ${collectionName}`);
+      } catch (err) {
+        console.warn(`⚠️ Could not create indexes for ${collectionName}:`, err.message);
+      }
+    }
+  } catch (error) {
+    console.warn('⚠️ Database index setup failed:', error.message);
+  }
+};
+
+// Call setup function when database connects
+mongoose.connection.once('open', () => {
+  console.log('✅ Connected to MongoDB');
+  setupDatabaseIndexes();
 });
