@@ -55,7 +55,6 @@ app.use(express.json());
 // Example route
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-const PORT = process.env.PORT || 3000;
 
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => {
