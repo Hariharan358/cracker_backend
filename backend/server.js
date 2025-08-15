@@ -29,73 +29,61 @@ const __dirname = path.dirname(__filename);
 const app = express();
 
 // Configure Helmet with CORS-friendly settings
+app.set("trust proxy", 1);
+
+// 1️⃣ Helmet with CORS-friendly settings
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   crossOriginEmbedderPolicy: false
 }));
-app.set("trust proxy", 1);
+
+// 2️⃣ Compression
 app.use(compression());
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+// 3️⃣ Allowed origins
+const allowedOrigins = [
+  "https://www.kmpyrotech.com",
+  "https://kmpyrotech.com",
+  "http://localhost:5000",
+  "http://localhost:5173"
+];
+
+// 4️⃣ CORS setup with logging
+app.use(cors({
+  origin: (origin, callback) => {
+    console.log(`🌐 CORS Request from: ${origin || "Unknown"}`);
+    if (!origin || allowedOrigins.includes(origin)) {
+      console.log(`✅ Origin allowed: ${origin}`);
+      callback(null, true);
+    } else {
+      console.log(`❌ Origin blocked: ${origin}`);
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
+}));
+
+// Preflight requests
+app.options("*", cors());
+
+// 5️⃣ Rate limiting
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
-});
-app.use(limiter);
-// Configure CORS to allow requests from your frontend domain
-const corsOptions = {
-  origin: [
-    'https://www.kmpyrotech.com',
-    'https://kmpyrotech.com',
-    'http://localhost:5000',
-    'http://localhost:5173'
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
-};
+}));
 
-console.log('🌐 CORS Configuration:', corsOptions);
-app.use(cors(corsOptions));
-
-// Handle preflight requests
-app.options('*', cors());
-
-// Add additional CORS headers middleware
-app.use((req, res, next) => {
-  // Log CORS-related requests for debugging
-  console.log(`🌐 CORS Request: ${req.method} ${req.path} from origin: ${req.headers.origin}`);
-  
-  // Check if origin is in allowed list
-  const allowedOrigins = [
-    'https://www.kmpyrotech.com',
-    'https://kmpyrotech.com',
-    'http://localhost:5000',
-    'http://localhost:5173',
-    'http://localhost:8080'
-  ];
-  
-  const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-    console.log(`✅ Origin allowed: ${origin}`);
-  } else {
-    console.log(`⚠️ Origin not in allowed list: ${origin}`);
-  }
-  
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  
-  if (req.method === 'OPTIONS') {
-    console.log('✅ Preflight request handled');
-    res.sendStatus(200);
-  } else {
-    next();
-  }
-});
+// 6️⃣ JSON body parsing
 app.use(express.json());
+
+// 7️⃣ Health check (Railway ping)
+app.get("/", (req, res) => {
+  res.json({ status: "Backend is running ✅" });
+});
+
 const cache = apicache.middleware;
 
 mongoose.connect(process.env.MONGODB_URI)
