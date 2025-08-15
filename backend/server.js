@@ -44,62 +44,25 @@ const limiter = rateLimit({
 app.use(limiter);
 // Configure CORS to allow requests from your frontend domain
 const corsOptions = {
-  origin: [
-    'https://www.kmpyrotech.com',
-    'https://kmpyrotech.com',
-    'http://localhost:3000',
-    'http://localhost:5173'
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+  origin: ['https://www.kmpyrotech.com','https://kmpyrotech.com'],
+  credentials: true
 };
-
-console.log('🌐 CORS Configuration:', corsOptions);
 app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
-// Handle preflight requests
-app.options('*', cors());
-
-// Add additional CORS headers middleware
-app.use((req, res, next) => {
-  // Log CORS-related requests for debugging
-  console.log(`🌐 CORS Request: ${req.method} ${req.path} from origin: ${req.headers.origin}`);
-  
-  // Check if origin is in allowed list
-  const allowedOrigins = [
-    'https://www.kmpyrotech.com',
-    'https://kmpyrotech.com',
-    'http://localhost:3000',
-    'http://localhost:5173'
-  ];
-  
-  const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-    console.log(`✅ Origin allowed: ${origin}`);
-  } else {
-    console.log(`⚠️ Origin not in allowed list: ${origin}`);
-  }
-  
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  
-  if (req.method === 'OPTIONS') {
-    console.log('✅ Preflight request handled');
-    res.sendStatus(200);
-  } else {
-    next();
-  }
-});
 app.use(express.json());
-const cache = apicache.middleware;
+
+// Example route
+app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+
+const PORT = process.env.PORT || 3000;
 
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ MongoDB connected'))
+  .then(() => {
+    console.log('✅ MongoDB connected');
+    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+  })
   .catch(err => console.error('❌ MongoDB connection error:', err));
-
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
