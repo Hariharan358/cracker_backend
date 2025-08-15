@@ -17,11 +17,27 @@ import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import apicache from 'apicache';
+import Queue from 'bull'; // Added for background jobs
 
 import admin from 'firebase-admin'; // <-- Add this line
 
-
 dotenv.config();
+
+// Validate required environment variables
+const requiredEnvVars = [
+  'MONGODB_URI',
+  'CLOUDINARY_CLOUD_NAME',
+  'CLOUDINARY_API_KEY',
+  'CLOUDINARY_API_SECRET',
+  'ADMIN_USERNAME',
+  'ADMIN_PASSWORD'
+];
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`❌ Missing environment variable: ${envVar}`);
+    process.exit(1);
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,13 +71,6 @@ app.use(express.json());
 // Example route
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => {
-    console.log('✅ MongoDB connected');
-    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-  })
-  .catch(err => console.error('❌ MongoDB connection error:', err));
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -130,7 +139,7 @@ app.get('/api/orders/track', async (req, res) => {
     }
     res.json(order);
   } catch (error) {
-    console.error('❌ Error tracking order:', error);
+    console.error('❌ Error tracking order:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to fetch order details' });
   }
 });
@@ -172,7 +181,7 @@ app.post('/api/orders/upload-payment', upload.single('screenshot'), async (req, 
       order: updatedOrder 
     });
   } catch (error) {
-    console.error('❌ Error uploading payment screenshot:', error);
+    console.error('❌ Error uploading payment screenshot:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to upload payment screenshot' });
   }
 });
@@ -210,15 +219,15 @@ app.patch('/api/orders/verify-payment/:orderId', async (req, res) => {
       order 
     });
   } catch (error) {
-    console.error('❌ Error verifying payment:', error);
+    console.error('❌ Error verifying payment:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to verify payment' });
   }
 });
 
-// ✅ GET: All Orders
+// ✅ GET: All Orders with Pagination
 app.get('/api/orders', async (req, res) => {
   try {
-    const { date, orderId } = req.query;
+    const { date, orderId, page = 1, limit = 20 } = req.query;
     const query = {};
     if (orderId) query.orderId = { $regex: orderId, $options: 'i' };
     if (date) {
@@ -227,10 +236,15 @@ app.get('/api/orders', async (req, res) => {
       end.setHours(23, 59, 59, 999);
       query.createdAt = { $gte: start, $lte: end };
     }
-    const orders = await Order.find(query).sort({ createdAt: -1 });
-    res.json(orders);
+    const orders = await Order.find(query)
+      .sort({ createdAt: -1 })
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit))
+      .lean();
+    const total = await Order.countDocuments(query);
+    res.json({ orders, total, page: Number(page), limit: Number(limit) });
   } catch (error) {
-    console.error("❌ Error fetching orders:", error);
+    console.error("❌ Error fetching orders:", error.message, error.stack);
     res.status(500).json({ error: "Failed to fetch orders" });
   }
 });
@@ -358,6 +372,19 @@ async function sendEmailWithInvoice(to, filePath) {
   });
 }
 
+// Setup Bull queue for invoice processing (requires REDIS_URL in env)
+const invoiceQueue = new Queue('invoice-processing', process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+
+invoiceQueue.process(async (job) => {
+  try {
+    await sendEmailWithInvoice(job.data.email, job.data.invoicePath);
+    console.log(`✅ Email sent for order ${job.data.orderId}`);
+    fs.unlinkSync(job.data.invoicePath); // Clean up
+  } catch (err) {
+    console.error(`❌ Failed to process invoice for order ${job.data.orderId}:`, err.message, err.stack);
+  }
+});
+
 // ✅ DELETE: Cancel Order
 app.delete('/api/orders/cancel/:orderId', async (req, res) => {
   try {
@@ -368,7 +395,7 @@ app.delete('/api/orders/cancel/:orderId', async (req, res) => {
     }
     res.status(200).json({ message: '✅ Order cancelled successfully', orderId });
   } catch (error) {
-    console.error('❌ Order cancellation error:', error);
+    console.error('❌ Order cancellation error:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to cancel order' });
   }
 });
@@ -389,15 +416,10 @@ app.post('/api/products', upload.single('image'), async (req, res) => {
     await newProduct.save();
     res.status(201).json({ message: '✅ Product added successfully', product: newProduct });
   } catch (error) {
-    console.error('❌ Product POST error:', error);
+    console.error('❌ Product POST error:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to add product' });
   }
 });
-
-
-
-
-
 
 // ✅ BULK DISCOUNT: Apply discount to all products in all categories
 app.post('/api/products/apply-discount', async (req, res) => {
@@ -429,7 +451,7 @@ app.post('/api/products/apply-discount', async (req, res) => {
     }
     res.json({ message: `✅ Discount applied to all products.`, updated: totalUpdated });
   } catch (error) {
-    console.error('❌ Error applying discount:', error);
+    console.error('❌ Error applying discount:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to apply discount to products.' });
   }
 });
@@ -453,12 +475,8 @@ try {
   console.log('⚠️ Firebase Admin initialization failed:', error.message);
 }
 
-
-
 // FCM Token storage (in production, use a database)
 const fcmTokens = new Map();
-
-
 
 // ✅ POST: Place Order
 app.post('/api/orders/place', async (req, res) => {
@@ -523,27 +541,18 @@ app.post('/api/orders/place', async (req, res) => {
     // Generate invoice path
     const invoicePath = path.join(invoiceDir, `${orderId}.pdf`);
     
-    // Generate invoice (optional - will work without email)
+    // Generate invoice and queue email (background job)
     try {
       generateInvoice(newOrder, invoicePath);
-      console.log('✅ Invoice generated successfully');
-    } catch (invoiceError) {
-      console.error('⚠️ Invoice generation failed:', invoiceError);
-    }
-    
-    // Send email with invoice (optional - will work without email config)
-    try {
       if (process.env.EMAIL_FROM && process.env.EMAIL_PASS) {
-        await sendEmailWithInvoice(customerDetails.email, invoicePath);
-        console.log('✅ Email sent successfully');
+        invoiceQueue.add({ email: customerDetails.email, invoicePath, orderId });
+        console.log('✅ Invoice job queued');
       } else {
         console.log('⚠️ Email not sent - missing email configuration');
       }
-    } catch (emailError) {
-      console.error('⚠️ Email sending failed:', emailError);
+    } catch (invoiceError) {
+      console.error('⚠️ Invoice generation failed:', invoiceError.message, invoiceError.stack);
     }
-    
-
     
     // Send push notification to admin about new order (optional)
     try {
@@ -568,12 +577,12 @@ app.post('/api/orders/place', async (req, res) => {
         console.log('⚠️ Admin notification not sent - missing FCM token or Firebase config');
       }
     } catch (notificationError) {
-      console.error('⚠️ Failed to send admin notification:', notificationError);
+      console.error('⚠️ Failed to send admin notification:', notificationError.message, notificationError.stack);
     }
     
     res.status(201).json({ message: '✅ Order placed successfully', orderId });
   } catch (error) {
-    console.error('❌ Order placement error:', error);
+    console.error('❌ Order placement error:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to place order' });
   }
 });
@@ -591,7 +600,7 @@ app.post('/api/admin/login', (req, res) => {
 });
 
 // ✅ GET: Analytics
-app.get('/api/analytics', cache('2 minutes'), async (req, res) => {
+app.get('/api/analytics', apicache.middleware('2 minutes'), async (req, res) => {
   try {
     const { date } = req.query;
     let orders;
@@ -613,7 +622,7 @@ app.get('/api/analytics', cache('2 minutes'), async (req, res) => {
     }, 0);
     res.json({ totalOrders, totalRevenue });
   } catch (error) {
-    console.error("❌ Analytics fetch error:", error);
+    console.error("❌ Analytics fetch error:", error.message, error.stack);
     res.status(500).json({ error: "Failed to fetch analytics" });
   }
 });
@@ -703,18 +712,18 @@ app.patch('/api/orders/update-status/:orderId', async (req, res) => {
         }
       }
     } catch (notificationError) {
-      console.error('❌ Failed to send customer notification:', notificationError);
+      console.error('❌ Failed to send customer notification:', notificationError.message, notificationError.stack);
     }
 
     res.json({ message: "✅ Order updated successfully", order });
   } catch (error) {
-    console.error("❌ Status update error:", error);
+    console.error("❌ Status update error:", error.message, error.stack);
     res.status(500).json({ error: "Failed to update order status" });
   }
 });
 
 // ✅ GET: Home Page Products (Optimized for first impression)
-app.get('/api/products/home', cache('3 minutes'), async (req, res) => {
+app.get('/api/products/home', apicache.middleware('3 minutes'), async (req, res) => {
   try {
     // Prioritize Atom Bomb and Sparkler products for home page
     const featuredCategories = ['ATOM_BOMB', 'SPARKLER_ITEMS'];
@@ -751,13 +760,13 @@ app.get('/api/products/home', cache('3 minutes'), async (req, res) => {
     const allHomeProducts = homeProducts.flat();
     res.json(allHomeProducts);
   } catch (error) {
-    console.error('❌ Error fetching home page products:', error);
+    console.error('❌ Error fetching home page products:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to fetch home page products' });
   }
 });
 
 // ✅ GET: Products by Category (Optimized)
-app.get('/api/products/category/:category', cache('2 minutes'), async (req, res) => {
+app.get('/api/products/category/:category', apicache.middleware('2 minutes'), async (req, res) => {
   try {
     const category = req.params.category;
     const ProductModel = getProductModelByCategory(category);
@@ -781,25 +790,25 @@ app.get('/api/products/category/:category', cache('2 minutes'), async (req, res)
     
     res.json(productsWithCategory);
   } catch (error) {
-    console.error('❌ Error fetching category products:', error);
+    console.error('❌ Error fetching category products:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to fetch products by category' });
   }
 });
 
-// ✅ GET: All Products across all categories (Optimized with better caching)
-app.get('/api/products/all', cache('5 minutes'), async (req, res) => {
+// ✅ GET: All Products across all categories (Optimized with better caching and limits)
+app.get('/api/products/all', apicache.middleware('5 minutes'), async (req, res) => {
   try {
     const collections = await mongoose.connection.db.listCollections().toArray();
     const categoryCollectionNames = collections
       .map((c) => c.name)
       .filter((name) => /^[A-Z0-9_]+$/.test(name));
 
-    // Fetch all collections in parallel with optimized queries
+    // Fetch all collections in parallel with optimized queries and limits
     const allProductsArrays = await Promise.all(
       categoryCollectionNames.map(async (collectionName) => {
         try {
           const Model = mongoose.model(collectionName, productSchema, collectionName);
-          // Use lean() for faster plain objects, project only needed fields
+          // Use lean() for faster plain objects, project only needed fields, limit to 100 per category
           const docs = await Model.find({}, {
             name_en: 1,
             name_ta: 1,
@@ -807,7 +816,7 @@ app.get('/api/products/all', cache('5 minutes'), async (req, res) => {
             original_price: 1,
             imageUrl: 1,
             youtube_url: 1,
-          }).lean();
+          }).limit(100).lean();
           
           const category = collectionName.replace(/_/g, ' ');
           return docs.map((doc) => ({ ...doc, category }));
@@ -818,10 +827,10 @@ app.get('/api/products/all', cache('5 minutes'), async (req, res) => {
       })
     );
 
-    const allProducts = ([]).concat(...allProductsArrays);
+    const allProducts = [].concat(...allProductsArrays);
     res.json(allProducts);
   } catch (error) {
-    console.error('❌ Error fetching all products:', error);
+    console.error('❌ Error fetching all products:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to fetch all products' });
   }
 });
@@ -851,7 +860,7 @@ app.delete('/api/products/:id', async (req, res) => {
       res.status(404).json({ error: 'Product not found' });
     }
   } catch (error) {
-    console.error('❌ Product DELETE error:', error);
+    console.error('❌ Product DELETE error:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to delete product' });
   }
 });
@@ -868,7 +877,7 @@ app.post('/api/notifications/register-token', async (req, res) => {
     console.log(`✅ FCM token registered for user: ${userId}`);
     res.json({ message: 'Token registered successfully' });
   } catch (error) {
-    console.error('❌ Error registering FCM token:', error);
+    console.error('❌ Error registering FCM token:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to register token' });
   }
 });
@@ -900,7 +909,7 @@ app.post('/api/notifications/send', async (req, res) => {
     console.log('✅ Push notification sent:', response);
     res.json({ message: 'Notification sent successfully', messageId: response });
   } catch (error) {
-    console.error('❌ Error sending push notification:', error);
+    console.error('❌ Error sending push notification:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to send notification' });
   }
 });
@@ -936,7 +945,7 @@ app.post('/api/notifications/send-to-all', async (req, res) => {
       failureCount: response.failureCount
     });
   } catch (error) {
-    console.error('❌ Error sending multicast notification:', error);
+    console.error('❌ Error sending multicast notification:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to send notifications' });
   }
 });
@@ -958,7 +967,7 @@ app.use((req, res, next) => {
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error('❌ Server error:', err);
+  console.error('❌ Server error:', err.message, err.stack);
   
   // Handle CORS errors specifically
   if (err.message && err.message.includes('CORS')) {
@@ -972,17 +981,24 @@ app.use((err, req, res, next) => {
   
   res.status(500).json({ 
     error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong',
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
   });
 });
 
 // ✅ GET: Performance metrics
 app.get('/api/performance', (req, res) => {
+  const memory = process.memoryUsage();
   res.json({
     status: 'Server running',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    memory: process.memoryUsage(),
+    memory: {
+      rss: `${(memory.rss / 1024 / 1024).toFixed(2)} MB`,
+      heapTotal: `${(memory.heapTotal / 1024 / 1024).toFixed(2)} MB`,
+      heapUsed: `${(memory.heapUsed / 1024 / 1024).toFixed(2)} MB`,
+      external: `${(memory.external / 1024 / 1024).toFixed(2)} MB`,
+    },
     endpoints: {
       home: '/api/products/home - Optimized for first impression',
       category: '/api/products/category/:category - Optimized with lean queries',
@@ -992,9 +1008,16 @@ app.get('/api/performance', (req, res) => {
 });
 
 // ✅ Health check endpoint for Railway
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  let mongoStatus = 'disconnected';
+  try {
+    await mongoose.connection.db.admin().ping();
+    mongoStatus = 'connected';
+  } catch (err) {
+    console.error('❌ MongoDB health check failed:', err.message, err.stack);
+  }
   res.json({
-    status: 'healthy',
+    status: mongoStatus === 'connected' ? 'healthy' : 'unhealthy',
     timestamp: new Date().toISOString(),
     cors: 'enabled',
     allowedOrigins: [
@@ -1002,7 +1025,9 @@ app.get('/health', (req, res) => {
       'https://kmpyrotech.com',
       'http://localhost:3000',
       'http://localhost:5173'
-    ]
+    ],
+    mongoStatus,
+    uptime: process.uptime(),
   });
 });
 
@@ -1019,12 +1044,20 @@ app.get('/api/test-cors', (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
-  console.log(`🌐 CORS enabled for origins: https://www.kmpyrotech.com, https://kmpyrotech.com`);
-  console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📊 Railway deployment: ${process.env.RAILWAY_ENVIRONMENT ? 'Yes' : 'No'}`);
-});
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => {
+    console.log('✅ MongoDB connected');
+    app.listen(PORT, () => {
+      console.log(`🚀 Server is running on port ${PORT}`);
+      console.log(`🌐 CORS enabled for origins: ${corsOptions.origin.join(', ')}`);
+      console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`📊 Railway deployment: ${process.env.RAILWAY_ENVIRONMENT ? 'Yes' : 'No'}`);
+    });
+  })
+  .catch(err => {
+    console.error('❌ MongoDB connection error:', err.message, err.stack);
+    process.exit(1);
+  });
 
 // Performance optimization: Add database indexes for faster queries
 const setupDatabaseIndexes = async () => {
@@ -1039,9 +1072,11 @@ const setupDatabaseIndexes = async () => {
       try {
         const collection = mongoose.connection.db.collection(collectionName);
         await collection.createIndex({ name_en: 1 });
+        console.log(`✅ Index created on name_en for ${collectionName}`);
         await collection.createIndex({ category: 1 });
+        console.log(`✅ Index created on category for ${collectionName}`);
         await collection.createIndex({ price: 1 });
-        console.log(`✅ Indexes created for collection: ${collectionName}`);
+        console.log(`✅ Index created on price for ${collectionName}`);
       } catch (err) {
         console.warn(`⚠️ Could not create indexes for ${collectionName}:`, err.message);
       }
