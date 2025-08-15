@@ -1,13 +1,8 @@
-// ✅ Fixed Backend + Updated Track Order + Update Status + Fetch Orders with Date and Partial OrderId Filters
-
 import express from 'express';
 import mongoose from 'mongoose';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import multer from 'multer';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { v2 as cloudinary } from 'cloudinary';
 import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import PDFDocument from 'pdfkit';
@@ -17,13 +12,14 @@ import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import apicache from 'apicache';
-import Queue from 'bull'; // Added for background jobs
-
-import admin from 'firebase-admin'; // <-- Add this line
+import Queue from 'bull';
+import { createClient } from 'redis';
+import admin from 'firebase-admin';
+import { body, validationResult } from 'express-validator';
 
 dotenv.config();
 
-// Validate required environment variables
+// Validate environment variables
 const requiredEnvVars = [
   'MONGODB_URI',
   'CLOUDINARY_CLOUD_NAME',
@@ -39,424 +35,72 @@ for (const envVar of requiredEnvVars) {
   }
 }
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 const app = express();
+app.set('timeout', 60000); // 60-second timeout
 
-// Configure Helmet with CORS-friendly settings
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" },
-  crossOriginEmbedderPolicy: false
-}));
-
-app.use(compression());
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  standardHeaders: true,
-  legacyHeaders: false,
+// Global error handlers
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught Exception:', err.message, err.stack);
+  if (process.env.NODE_ENV !== 'production') process.exit(1);
 });
-app.use(limiter);
-// Configure CORS to allow requests from your frontend domain
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  if (process.env.NODE_ENV !== 'production') process.exit(1);
+});
+
+// Security and performance middleware
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" }, crossOriginEmbedderPolicy: false }));
+app.use(compression());
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false }));
+
+// CORS configuration
 const corsOptions = {
-  origin: ['https://www.kmpyrotech.com','https://kmpyrotech.com'],
-  credentials: true
+  origin: function (origin, callback) {
+    const allowedOrigins = [
+      'https://www.kmpyrotech.com',
+      'https://kmpyrotech.com',
+      process.env.FRONTEND_URL,
+      process.env.NODE_ENV === 'development' ? 'http://localhost:3000' : null,
+      process.env.NODE_ENV === 'development' ? 'http://localhost:5173' : null
+    ].filter(Boolean);
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS policy: Origin ${origin} not allowed`));
+    }
+  },
+  credentials: true,
+  optionsSuccessStatus: 200
 };
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+
+// Handle CORS errors
+app.use((err, req, res, next) => {
+  if (err.message.includes('CORS policy')) {
+    console.error(`❌ CORS error: ${err.message}`);
+    return res.status(403).json({ error: 'CORS policy violation', message: 'Origin not allowed' });
+  }
+  next(err);
+});
 
 app.use(express.json());
 
-// Example route
-app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
-
+// Cloudinary configuration
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-const invoiceDir = path.join(__dirname, 'invoices');
-if (!fs.existsSync(invoiceDir)) fs.mkdirSync(invoiceDir);
-// Remove static serving of invoices. Use custom endpoint below.
-
-// Custom endpoint: Serve and delete invoice after download
-app.get('/invoices/:filename', (req, res) => {
-  const filePath = path.join(invoiceDir, req.params.filename);
-  res.download(filePath, (err) => {
-    if (!err) {
-      // Delete the file after successful download
-      fs.unlink(filePath, (unlinkErr) => {
-        if (unlinkErr) console.error('Error deleting invoice:', unlinkErr);
-      });
-    }
-  });
-});
-
+// Multer setup for image uploads
 const storage = new CloudinaryStorage({
   cloudinary,
-  params: {
-    folder: 'products',
-    allowed_formats: ['jpg', 'jpeg', 'png'],
-    public_id: (req, file) => `${Date.now()}-${file.originalname}`
-  }
+  params: { folder: 'products', allowed_formats: ['jpg', 'jpeg', 'png'], public_id: (req, file) => `${Date.now()}-${file.originalname}` }
 });
 const upload = multer({ storage });
 
-const modelCache = {};
-const productSchema = new mongoose.Schema({
-  name_en: String,
-  name_ta: String,
-  price: Number,
-  original_price: Number, // Add this field
-  imageUrl: String,
-  youtube_url: String, // Add this field
-  category: String,    // Add this field for completeness
-}, { timestamps: true });
-
-function getProductModelByCategory(category) {
-  const modelName = category.replace(/\s+/g, '_').toUpperCase();
-  if (!modelCache[modelName]) {
-    modelCache[modelName] = mongoose.model(modelName, productSchema, modelName);
-  }
-  return modelCache[modelName];
-}
-
-// ✅ GET: Track Order
-app.get('/api/orders/track', async (req, res) => {
-  try {
-    const { orderId, mobile } = req.query;
-    if (!orderId || !mobile) {
-      return res.status(400).json({ error: 'Missing orderId or mobile number' });
-    }
-    const order = await Order.findOne({
-      orderId: String(orderId),
-      'customerDetails.mobile': String(mobile)
-    });
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-    res.json(order);
-  } catch (error) {
-    console.error('❌ Error tracking order:', error.message, error.stack);
-    res.status(500).json({ error: 'Failed to fetch order details' });
-  }
-});
-
-// ✅ POST: Upload Payment Screenshot
-app.post('/api/orders/upload-payment', upload.single('screenshot'), async (req, res) => {
-  try {
-    const { orderId, mobile } = req.body;
-    
-    if (!orderId || !mobile || !req.file) {
-      return res.status(400).json({ error: 'Missing orderId, mobile number, or screenshot' });
-    }
-
-    // Verify order exists and belongs to the customer
-    const order = await Order.findOne({
-      orderId: String(orderId),
-      'customerDetails.mobile': String(mobile)
-    });
-
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found or mobile number does not match' });
-    }
-
-    // Update order with payment screenshot
-    const updatedOrder = await Order.findOneAndUpdate(
-      { orderId: String(orderId) },
-      {
-        $set: {
-          'paymentScreenshot.imageUrl': req.file.path,
-          'paymentScreenshot.uploadedAt': new Date(),
-          'paymentScreenshot.verified': false
-        }
-      },
-      { new: true }
-    );
-
-    res.json({ 
-      message: '✅ Payment screenshot uploaded successfully', 
-      order: updatedOrder 
-    });
-  } catch (error) {
-    console.error('❌ Error uploading payment screenshot:', error.message, error.stack);
-    res.status(500).json({ error: 'Failed to upload payment screenshot' });
-  }
-});
-
-// ✅ PATCH: Verify Payment Screenshot (Admin only)
-app.patch('/api/orders/verify-payment/:orderId', async (req, res) => {
-  try {
-    const { orderId } = req.params;
-    const { verified, verifiedBy } = req.body;
-
-    if (typeof verified !== 'boolean') {
-      return res.status(400).json({ error: 'Verified status is required' });
-    }
-
-    const updateFields = {
-      'paymentScreenshot.verified': verified,
-      'paymentScreenshot.verifiedBy': verifiedBy || 'admin',
-      'paymentScreenshot.verifiedAt': new Date(),
-      // Update order status to 'payment_verified' when payment is verified
-      status: verified ? 'payment_verified' : 'confirmed'
-    };
-
-    const order = await Order.findOneAndUpdate(
-      { orderId },
-      { $set: updateFields },
-      { new: true }
-    );
-
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
-    res.json({ 
-      message: `✅ Payment ${verified ? 'verified' : 'rejected'} successfully`, 
-      order 
-    });
-  } catch (error) {
-    console.error('❌ Error verifying payment:', error.message, error.stack);
-    res.status(500).json({ error: 'Failed to verify payment' });
-  }
-});
-
-// ✅ GET: All Orders with Pagination
-app.get('/api/orders', async (req, res) => {
-  try {
-    const { date, orderId, page = 1, limit = 20 } = req.query;
-    const query = {};
-    if (orderId) query.orderId = { $regex: orderId, $options: 'i' };
-    if (date) {
-      const start = new Date(date);
-      const end = new Date(date);
-      end.setHours(23, 59, 59, 999);
-      query.createdAt = { $gte: start, $lte: end };
-    }
-    const orders = await Order.find(query)
-      .sort({ createdAt: -1 })
-      .skip((Number(page) - 1) * Number(limit))
-      .limit(Number(limit))
-      .lean();
-    const total = await Order.countDocuments(query);
-    res.json({ orders, total, page: Number(page), limit: Number(limit) });
-  } catch (error) {
-    console.error("❌ Error fetching orders:", error.message, error.stack);
-    res.status(500).json({ error: "Failed to fetch orders" });
-  }
-});
-
-function generateInvoice(order, filePath) {
-  const doc = new PDFDocument({ margin: 40 });
-  doc.pipe(fs.createWriteStream(filePath));
-
-  // Header
-  doc
-    .fontSize(28)
-    .fillColor('#d97706')
-    .text('KMPyrotech Invoice', { align: 'center', underline: true });
-  doc.moveDown(2);
-
-  // Draw main box
-  const boxTop = doc.y;
-  const boxLeft = 40;
-  const boxWidth = 520;
-  let boxHeight = 350 + (order.items.length * 25);
-
-  // Draw rectangle (box)
-  doc
-    .lineWidth(2)
-    .roundedRect(boxLeft, boxTop, boxWidth, boxHeight, 12)
-    .stroke('#d97706');
-
-  // Customer Information Section
-  doc.moveDown(0.5);
-  doc.fontSize(14).fillColor('#d97706').font('Helvetica-Bold');
-  doc.text('Customer Information', boxLeft + 16, doc.y + 20);
-  
-  doc.fontSize(12).fillColor('#222').font('Helvetica');
-  const startY = doc.y + 40;
-  
-  // Left column
-  doc.text(`Order ID: ${order.orderId}`, boxLeft + 16, startY);
-  doc.text(`Name: ${order.customerDetails.fullName}`, boxLeft + 16, startY + 25);
-  doc.text(`Mobile: ${order.customerDetails.mobile}`, boxLeft + 16, startY + 50);
-  doc.text(`Address: ${order.customerDetails.address}`, boxLeft + 16, startY + 75, { width: 240 });
-  
-  // Right column
-  doc.text(`Date: ${new Date(order.createdAt).toLocaleString('en-IN')}`, boxLeft + 280, startY);
-  doc.text(`Email: ${order.customerDetails.email}`, boxLeft + 280, startY + 25);
-  doc.text(`Pincode: ${order.customerDetails.pincode}`, boxLeft + 280, startY + 50);
-  
-  doc.moveDown(2);
-
-  // Products Table Header
-  doc.font('Helvetica-Bold').fontSize(14).fillColor('#d97706');
-  doc.text('Order Items', boxLeft + 16, doc.y + 20);
-  
-  // Table header line
-  doc.moveDown(0.5);
-  doc.lineWidth(1);
-  doc.moveTo(boxLeft + 16, doc.y + 5);
-  doc.lineTo(boxLeft + boxWidth - 16, doc.y + 5);
-  doc.stroke('#d97706');
-  
-  // Table columns header
-  doc.font('Helvetica-Bold').fontSize(11).fillColor('#d97706');
-  const tableY = doc.y + 15;
-  doc.text('No.', boxLeft + 16, tableY);
-  doc.text('Product Name', boxLeft + 60, tableY);
-  doc.text('Qty', boxLeft + 280, tableY);
-  doc.text('Price', boxLeft + 320, tableY);
-  doc.text('Total', boxLeft + 380, tableY);
-  
-  // Table header line
-  doc.moveTo(boxLeft + 16, tableY + 15);
-  doc.lineTo(boxLeft + boxWidth - 16, tableY + 15);
-  doc.stroke('#d97706');
-
-  // Products Table Rows
-  doc.font('Helvetica').fontSize(11).fillColor('#222');
-  order.items.forEach((item, idx) => {
-    const rowY = tableY + 25 + (idx * 20);
-    doc.text(`${idx + 1}.`, boxLeft + 16, rowY);
-    doc.text(item.name_en, boxLeft + 60, rowY, { width: 200 });
-    doc.text(`${item.quantity}`, boxLeft + 280, rowY);
-    doc.text(`₹${item.price}`, boxLeft + 320, rowY);
-    doc.text(`₹${item.price * item.quantity}`, boxLeft + 380, rowY);
-  });
-  
-  // Table bottom line
-  const lastRowY = tableY + 25 + (order.items.length * 20);
-  doc.moveTo(boxLeft + 16, lastRowY + 10);
-  doc.lineTo(boxLeft + boxWidth - 16, lastRowY + 10);
-  doc.stroke('#d97706');
-
-  // Order Summary
-  doc.moveDown(1);
-  doc.font('Helvetica-Bold').fontSize(12).fillColor('#222');
-  doc.text(`Order Status: ${order.status || 'confirmed'}`, boxLeft + 16, lastRowY + 30);
-  
-  // Total Amount
-  doc.fontSize(16).fillColor('#d97706');
-  doc.text(`Total Amount: ₹${order.total}`, boxLeft + 280, lastRowY + 30);
-
-  // Thank you note
-  doc.moveDown(3);
-  doc.fontSize(14).fillColor('#16a34a').font('Helvetica-Bold');
-  doc.text('Thank you for shopping with KMPyrotech!', { align: 'center' });
-  doc.moveDown(0.5);
-  doc.fontSize(12).fillColor('#16a34a');
-  doc.text('Wishing you a safe and sparkling festival!', { align: 'center' });
-
-  doc.end();
-}
-
-async function sendEmailWithInvoice(to, filePath) {
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: process.env.EMAIL_FROM,
-      pass: process.env.EMAIL_PASS,
-    },
-  });
-  await transporter.sendMail({
-    from: `"KMPyrotech" <${process.env.EMAIL_FROM}>`,
-    to,
-    subject: 'KMPyrotech - Your Order Invoice',
-    text: 'Thank you for your order! Please find your invoice attached.',
-    attachments: [{ filename: 'invoice.pdf', path: filePath }],
-  });
-}
-
-// Setup Bull queue for invoice processing (requires REDIS_URL in env)
-const invoiceQueue = new Queue('invoice-processing', process.env.REDIS_URL || 'redis://127.0.0.1:6379');
-
-invoiceQueue.process(async (job) => {
-  try {
-    await sendEmailWithInvoice(job.data.email, job.data.invoicePath);
-    console.log(`✅ Email sent for order ${job.data.orderId}`);
-    fs.unlinkSync(job.data.invoicePath); // Clean up
-  } catch (err) {
-    console.error(`❌ Failed to process invoice for order ${job.data.orderId}:`, err.message, err.stack);
-  }
-});
-
-// ✅ DELETE: Cancel Order
-app.delete('/api/orders/cancel/:orderId', async (req, res) => {
-  try {
-    const { orderId } = req.params;
-    const deletedOrder = await Order.findOneAndDelete({ orderId });
-    if (!deletedOrder) {
-      return res.status(404).json({ error: 'Order not found.' });
-    }
-    res.status(200).json({ message: '✅ Order cancelled successfully', orderId });
-  } catch (error) {
-    console.error('❌ Order cancellation error:', error.message, error.stack);
-    res.status(500).json({ error: 'Failed to cancel order' });
-  }
-});
-
-// ✅ POST: Add Product
-app.post('/api/products', upload.single('image'), async (req, res) => {
-  try {
-    let { name_en, name_ta, price, original_price, category, youtube_url, imageUrl } = req.body;
-    let finalImageUrl = req.file?.path || imageUrl;
-    if (!name_en || !name_ta || !price || !category || !finalImageUrl) {
-      return res.status(400).json({ error: 'All fields including image (file or URL) and category are required.' });
-    }
-    // Ensure price and original_price are numbers
-    price = Number(price);
-    original_price = original_price ? Number(original_price) : undefined;
-    const ProductModel = getProductModelByCategory(category);
-    const newProduct = new ProductModel({ name_en, name_ta, price, original_price, imageUrl: finalImageUrl, youtube_url });
-    await newProduct.save();
-    res.status(201).json({ message: '✅ Product added successfully', product: newProduct });
-  } catch (error) {
-    console.error('❌ Product POST error:', error.message, error.stack);
-    res.status(500).json({ error: 'Failed to add product' });
-  }
-});
-
-// ✅ BULK DISCOUNT: Apply discount to all products in all categories
-app.post('/api/products/apply-discount', async (req, res) => {
-  try {
-    const { discount } = req.body;
-    if (typeof discount !== 'number' || discount < 0 || discount > 100) {
-      return res.status(400).json({ error: 'Invalid discount percentage.' });
-    }
-    // Get all collections that match the category naming pattern
-    const collections = await mongoose.connection.db.listCollections().toArray();
-    let totalUpdated = 0;
-    for (const col of collections) {
-      const modelName = col.name;
-      if (/^[A-Z0-9_]+$/.test(modelName)) {
-        const Model = mongoose.model(modelName, productSchema, modelName);
-        // Only update products that have an original_price
-        const result = await Model.updateMany(
-          { original_price: { $exists: true, $ne: null } },
-          [{ $set: { price: { $round: [{ $multiply: ["$original_price", (1 - discount / 100)] }, 0] } } }]
-        );
-        totalUpdated += result.modifiedCount || 0;
-      }
-    }
-    // Clear apicache for all product category endpoints (dynamic)
-    if (apicache.clearRegexp) {
-      apicache.clearRegexp(/\/api\/products\/category\//);
-    } else {
-      apicache.clear(); // fallback: clear all cache
-    }
-    res.json({ message: `✅ Discount applied to all products.`, updated: totalUpdated });
-  } catch (error) {
-    console.error('❌ Error applying discount:', error.message, error.stack);
-    res.status(500).json({ error: 'Failed to apply discount to products.' });
-  }
-});
-
-// Initialize Firebase Admin
+// Firebase initialization
 let firebaseApp;
 try {
   if (process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
@@ -472,114 +116,353 @@ try {
     console.log('⚠️ Firebase Admin not initialized - missing credentials');
   }
 } catch (error) {
-  console.log('⚠️ Firebase Admin initialization failed:', error.message);
+  console.error('❌ Firebase Admin initialization failed:', error.message, error.stack);
+  firebaseApp = null;
 }
 
-// FCM Token storage (in production, use a database)
+// Bull queue for background jobs
+const invoiceQueue = new Queue('invoice-processing', {
+  redis: { url: process.env.REDIS_URL || 'redis://127.0.0.1:6379', maxRetriesPerRequest: 3 },
+});
+invoiceQueue.on('error', (error) => console.error('❌ Bull queue error:', error.message, error.stack));
+invoiceQueue.on('failed', (job, err) => console.error(`❌ Job ${job.id} for order ${job.data.orderId} failed:`, err.message, err.stack));
+invoiceQueue.on('completed', (job) => {
+  job.remove();
+  console.log(`✅ Job ${job.id} for order ${job.data.orderId} completed`);
+});
+
+// MongoDB schema and model
+const modelCache = {};
+const productSchema = new mongoose.Schema({
+  name_en: String,
+  name_ta: String,
+  price: Number,
+  original_price: Number,
+  imageUrl: String,
+  youtube_url: String,
+  category: String,
+}, { timestamps: true });
+
+function getProductModelByCategory(category) {
+  const modelName = category.replace(/\s+/g, '_').toUpperCase();
+  if (!modelCache[modelName]) {
+    modelCache[modelName] = mongoose.model(modelName, productSchema, modelName);
+  }
+  return modelCache[modelName];
+}
+
+// Invoice generation (using Cloudinary)
+async function generateInvoice(order) {
+  const doc = new PDFDocument({ margin: 40 });
+  const buffers = [];
+  doc.on('data', buffers.push.bind(buffers));
+  doc.on('end', () => Promise.resolve(Buffer.concat(buffers)));
+
+  doc.fontSize(28).fillColor('#d97706').text('KMPyrotech Invoice', { align: 'center', underline: true });
+  doc.moveDown(2);
+  const boxTop = doc.y;
+  const boxLeft = 40;
+  const boxWidth = 520;
+  let boxHeight = 350 + (order.items.length * 25);
+  doc.lineWidth(2).roundedRect(boxLeft, boxTop, boxWidth, boxHeight, 12).stroke('#d97706');
+  doc.moveDown(0.5);
+  doc.fontSize(14).fillColor('#d97706').font('Helvetica-Bold').text('Customer Information', boxLeft + 16, doc.y + 20);
+  doc.fontSize(12).fillColor('#222').font('Helvetica');
+  const startY = doc.y + 40;
+  doc.text(`Order ID: ${order.orderId}`, boxLeft + 16, startY);
+  doc.text(`Name: ${order.customerDetails.fullName}`, boxLeft + 16, startY + 25);
+  doc.text(`Mobile: ${order.customerDetails.mobile}`, boxLeft + 16, startY + 50);
+  doc.text(`Address: ${order.customerDetails.address}`, boxLeft + 16, startY + 75, { width: 240 });
+  doc.text(`Date: ${new Date(order.createdAt).toLocaleString('en-IN')}`, boxLeft + 280, startY);
+  doc.text(`Email: ${order.customerDetails.email}`, boxLeft + 280, startY + 25);
+  doc.text(`Pincode: ${order.customerDetails.pincode}`, boxLeft + 280, startY + 50);
+  doc.moveDown(2);
+  doc.font('Helvetica-Bold').fontSize(14).fillColor('#d97706').text('Order Items', boxLeft + 16, doc.y + 20);
+  doc.moveDown(0.5);
+  doc.lineWidth(1).moveTo(boxLeft + 16, doc.y + 5).lineTo(boxLeft + boxWidth - 16, doc.y + 5).stroke('#d97706');
+  const tableY = doc.y + 15;
+  doc.font('Helvetica-Bold').fontSize(11).fillColor('#d97706');
+  doc.text('No.', boxLeft + 16, tableY);
+  doc.text('Product Name', boxLeft + 60, tableY);
+  doc.text('Qty', boxLeft + 280, tableY);
+  doc.text('Price', boxLeft + 320, tableY);
+  doc.text('Total', boxLeft + 380, tableY);
+  doc.moveTo(boxLeft + 16, tableY + 15).lineTo(boxLeft + boxWidth - 16, tableY + 15).stroke('#d97706');
+  doc.font('Helvetica').fontSize(11).fillColor('#222');
+  order.items.forEach((item, idx) => {
+    const rowY = tableY + 25 + (idx * 20);
+    doc.text(`${idx + 1}.`, boxLeft + 16, rowY);
+    doc.text(item.name_en, boxLeft + 60, rowY, { width: 200 });
+    doc.text(`${item.quantity}`, boxLeft + 280, rowY);
+    doc.text(`₹${item.price}`, boxLeft + 320, rowY);
+    doc.text(`₹${item.price * item.quantity}`, boxLeft + 380, rowY);
+  });
+  const lastRowY = tableY + 25 + (order.items.length * 20);
+  doc.moveTo(boxLeft + 16, lastRowY + 10).lineTo(boxLeft + boxWidth - 16, lastRowY + 10).stroke('#d97706');
+  doc.moveDown(1);
+  doc.font('Helvetica-Bold').fontSize(12).fillColor('#222').text(`Order Status: ${order.status || 'confirmed'}`, boxLeft + 16, lastRowY + 30);
+  doc.fontSize(16).fillColor('#d97706').text(`Total Amount: ₹${order.total}`, boxLeft + 280, lastRowY + 30);
+  doc.moveDown(3);
+  doc.fontSize(14).fillColor('#16a34a').font('Helvetica-Bold').text('Thank you for shopping with KMPyrotech!', { align: 'center' });
+  doc.moveDown(0.5);
+  doc.fontSize(12).fillColor('#16a34a').text('Wishing you a safe and sparkling festival!', { align: 'center' });
+  doc.end();
+
+  const pdfBuffer = await new Promise(resolve => {
+    const buffers = [];
+    doc.on('data', buffers.push.bind(buffers));
+    doc.on('end', () => resolve(Buffer.concat(buffers)));
+  });
+
+  const result = await cloudinary.uploader.upload_stream(
+    { folder: 'invoices', public_id: `${order.orderId}.pdf`, resource_type: 'raw' },
+    (error, uploadResult) => {
+      if (error) throw error;
+      return uploadResult.secure_url;
+    }
+  ).end(pdfBuffer);
+  return result.secure_url;
+}
+
+async function sendEmailWithInvoice(to, invoiceUrl) {
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: process.env.EMAIL_FROM, pass: process.env.EMAIL_PASS },
+  });
+  await transporter.sendMail({
+    from: `"KMPyrotech" <${process.env.EMAIL_FROM}>`,
+    to,
+    subject: 'KMPyrotech - Your Order Invoice',
+    text: 'Thank you for your order! Please find your invoice attached.',
+    attachments: [{ filename: 'invoice.pdf', path: invoiceUrl }],
+  });
+}
+
+// Routes
+app.get('/api/health', async (req, res) => {
+  let mongoStatus = 'disconnected';
+  let redisStatus = 'disconnected';
+  let firebaseStatus = firebaseApp ? 'initialized' : 'not initialized';
+  try {
+    await mongoose.connection.db.admin().ping();
+    mongoStatus = 'connected';
+  } catch (err) {
+    console.error('❌ MongoDB health check failed:', err.message, err.stack);
+  }
+  try {
+    const redisClient = createClient({ url: process.env.REDIS_URL || 'redis://127.0.0.1:6379' });
+    await redisClient.connect();
+    await redisClient.ping();
+    redisStatus = 'connected';
+    await redisClient.quit();
+  } catch (err) {
+    console.error('❌ Redis health check failed:', err.message, err.stack);
+  }
+  res.status(mongoStatus === 'connected' && redisStatus === 'connected' ? 200 : 503).json({
+    status: mongoStatus === 'connected' && redisStatus === 'connected' ? 'healthy' : 'unhealthy',
+    timestamp: new Date().toISOString(),
+    cors: 'enabled',
+    allowedOrigins: corsOptions.origin,
+    mongoStatus,
+    redisStatus,
+    firebaseStatus,
+    uptime: process.uptime(),
+  });
+});
+
+app.get('/api/orders/track', async (req, res) => {
+  try {
+    const { orderId, mobile } = req.query;
+    if (!orderId || !mobile) return res.status(400).json({ error: 'Missing orderId or mobile number' });
+    const order = await Order.findOne({ orderId: String(orderId), 'customerDetails.mobile': String(mobile) });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    res.json(order);
+  } catch (error) {
+    console.error('❌ Error tracking order:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to fetch order details' });
+  }
+});
+
+app.post('/api/orders/upload-payment', upload.single('screenshot'), async (req, res) => {
+  try {
+    const { orderId, mobile } = req.body;
+    if (!orderId || !mobile || !req.file) return res.status(400).json({ error: 'Missing orderId, mobile number, or screenshot' });
+    const order = await Order.findOne({ orderId: String(orderId), 'customerDetails.mobile': String(mobile) });
+    if (!order) return res.status(404).json({ error: 'Order not found or mobile number does not match' });
+    const updatedOrder = await Order.findOneAndUpdate(
+      { orderId: String(orderId) },
+      { $set: { 'paymentScreenshot.imageUrl': req.file.path, 'paymentScreenshot.uploadedAt': new Date(), 'paymentScreenshot.verified': false } },
+      { new: true }
+    );
+    res.json({ message: '✅ Payment screenshot uploaded successfully', order: updatedOrder });
+  } catch (error) {
+    console.error('❌ Error uploading payment screenshot:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to upload payment screenshot' });
+  }
+});
+
+app.patch('/api/orders/verify-payment/:orderId', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { verified, verifiedBy } = req.body;
+    if (typeof verified !== 'boolean') return res.status(400).json({ error: 'Verified status is required' });
+    const updateFields = {
+      'paymentScreenshot.verified': verified,
+      'paymentScreenshot.verifiedBy': verifiedBy || 'admin',
+      'paymentScreenshot.verifiedAt': new Date(),
+      status: verified ? 'payment_verified' : 'confirmed'
+    };
+    const order = await Order.findOneAndUpdate({ orderId }, { $set: updateFields }, { new: true });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    res.json({ message: `✅ Payment ${verified ? 'verified' : 'rejected'} successfully`, order });
+  } catch (error) {
+    console.error('❌ Error verifying payment:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to verify payment' });
+  }
+});
+
+app.get('/api/orders', async (req, res) => {
+  try {
+    const { date, orderId, page = 1, limit = 20 } = req.query;
+    const query = {};
+    if (orderId) query.orderId = { $regex: orderId, $options: 'i' };
+    if (date) {
+      const start = new Date(date);
+      const end = new Date(date);
+      end.setHours(23, 59, 59, 999);
+      query.createdAt = { $gte: start, $lte: end };
+    }
+    const orders = await Order.find(query).sort({ createdAt: -1 }).skip((Number(page) - 1) * Number(limit)).limit(Number(limit)).lean();
+    const total = await Order.countDocuments(query);
+    res.json({ orders, total, page: Number(page), limit: Number(limit) });
+  } catch (error) {
+    console.error('❌ Error fetching orders:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to fetch orders' });
+  }
+});
+
+app.delete('/api/orders/cancel/:orderId', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const deletedOrder = await Order.findOneAndDelete({ orderId });
+    if (!deletedOrder) return res.status(404).json({ error: 'Order not found' });
+    res.status(200).json({ message: '✅ Order cancelled successfully', orderId });
+  } catch (error) {
+    console.error('❌ Order cancellation error:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to cancel order' });
+  }
+});
+
+app.post('/api/products', upload.single('image'), async (req, res) => {
+  try {
+    let { name_en, name_ta, price, original_price, category, youtube_url, imageUrl } = req.body;
+    let finalImageUrl = req.file?.path || imageUrl;
+    if (!name_en || !name_ta || !price || !category || !finalImageUrl) return res.status(400).json({ error: 'All fields including image (file or URL) and category are required' });
+    price = Number(price);
+    original_price = original_price ? Number(original_price) : undefined;
+    const ProductModel = getProductModelByCategory(category);
+    const newProduct = new ProductModel({ name_en, name_ta, price, original_price, imageUrl: finalImageUrl, youtube_url });
+    await newProduct.save();
+    res.status(201).json({ message: '✅ Product added successfully', product: newProduct });
+  } catch (error) {
+    console.error('❌ Product POST error:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to add product' });
+  }
+});
+
+app.post('/api/products/apply-discount', async (req, res) => {
+  try {
+    const { discount } = req.body;
+    if (typeof discount !== 'number' || discount < 0 || discount > 100) return res.status(400).json({ error: 'Invalid discount percentage' });
+    const collections = await mongoose.connection.db.listCollections().toArray();
+    let totalUpdated = 0;
+    for (const col of collections) {
+      const modelName = col.name;
+      if (/^[A-Z0-9_]+$/.test(modelName)) {
+        const Model = mongoose.model(modelName, productSchema, modelName);
+        const result = await Model.updateMany(
+          { original_price: { $exists: true, $ne: null } },
+          [{ $set: { price: { $round: [{ $multiply: ["$original_price", (1 - discount / 100)] }, 0] } } }]
+        );
+        totalUpdated += result.modifiedCount || 0;
+      }
+    }
+    apicache.clear();
+    res.json({ message: `✅ Discount applied to all products`, updated: totalUpdated });
+  } catch (error) {
+    console.error('❌ Error applying discount:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to apply discount to products' });
+  }
+});
+
 const fcmTokens = new Map();
 
-// ✅ POST: Place Order
-app.post('/api/orders/place', async (req, res) => {
+app.post('/api/orders/place', [
+  body('items').isArray().notEmpty().withMessage('Items array is required'),
+  body('total').isNumeric().withMessage('Total must be a number'),
+  body('customerDetails.fullName').notEmpty().withMessage('Full name is required'),
+  body('customerDetails.mobile').notEmpty().withMessage('Mobile number is required'),
+  body('customerDetails.email').isEmail().withMessage('Valid email is required'),
+  body('customerDetails.address').notEmpty().withMessage('Address is required'),
+  body('customerDetails.pincode').notEmpty().withMessage('Pincode is required')
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
   try {
     const { items, total, customerDetails, status, createdAt } = req.body;
-    if (!items || !total || !customerDetails) {
-      return res.status(400).json({ error: 'Missing required order fields.' });
-    }
-
-    // Generate unique order ID on the backend
     const generateOrderId = async () => {
       const today = new Date();
-      const dateStr = today.getDate().toString().padStart(2, '0') + 
-                     (today.getMonth() + 1).toString().padStart(2, '0') + 
-                     today.getFullYear().toString().slice(-2);
-      
-      // Get the latest order for today to determine the next sequential number
+      const dateStr = today.getDate().toString().padStart(2, '0') + (today.getMonth() + 1).toString().padStart(2, '0') + today.getFullYear().toString().slice(-2);
       const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate());
       const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
-      
-      const latestOrder = await Order.findOne({
-        createdAt: { $gte: startOfDay, $lte: endOfDay }
-      }).sort({ orderId: -1 });
-      
+      const latestOrder = await Order.findOne({ createdAt: { $gte: startOfDay, $lte: endOfDay } }).sort({ orderId: -1 });
       let nextNumber = 1;
       if (latestOrder && latestOrder.orderId) {
-        // Extract the number from the latest order ID (last 2 digits)
         const match = latestOrder.orderId.match(/^(\d{8})(\d{2})$/);
-        if (match && match[1] === dateStr) {
-          nextNumber = parseInt(match[2]) + 1;
-        }
+        if (match && match[1] === dateStr) nextNumber = parseInt(match[2]) + 1;
       }
-      
-      // Format as DDMMYYYYNN (date + 2-digit sequential number)
       return `${dateStr}${nextNumber.toString().padStart(2, '0')}`;
     };
 
     let orderId;
     let attempts = 0;
     const maxAttempts = 10;
-    
-    // Try to generate a unique order ID
     do {
       orderId = await generateOrderId();
       attempts++;
-      if (attempts > maxAttempts) {
-        return res.status(500).json({ error: 'Failed to generate unique order ID' });
-      }
+      if (attempts > maxAttempts) return res.status(500).json({ error: 'Failed to generate unique order ID' });
     } while (await Order.findOne({ orderId }));
 
-    // Always start with 'confirmed' status when order is placed
-    const newOrder = new Order({
-      orderId,
-      items,
-      total,
-      customerDetails,
-      status: 'confirmed', // Always start with confirmed
-      createdAt: createdAt || new Date().toISOString(),
-    });
+    const newOrder = new Order({ orderId, items, total, customerDetails, status: 'confirmed', createdAt: createdAt || new Date().toISOString() });
     await newOrder.save();
-    
-    // Generate invoice path
-    const invoicePath = path.join(invoiceDir, `${orderId}.pdf`);
-    
-    // Generate invoice and queue email (background job)
+
     try {
-      generateInvoice(newOrder, invoicePath);
+      const invoiceUrl = await generateInvoice(newOrder);
       if (process.env.EMAIL_FROM && process.env.EMAIL_PASS) {
-        invoiceQueue.add({ email: customerDetails.email, invoicePath, orderId });
+        invoiceQueue.add({ email: customerDetails.email, invoiceUrl, orderId }, { attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
         console.log('✅ Invoice job queued');
-      } else {
-        console.log('⚠️ Email not sent - missing email configuration');
       }
     } catch (invoiceError) {
       console.error('⚠️ Invoice generation failed:', invoiceError.message, invoiceError.stack);
     }
-    
-    // Send push notification to admin about new order (optional)
+
     try {
       const adminToken = fcmTokens.get('admin');
       if (adminToken && firebaseApp) {
         const adminMessage = {
-          notification: {
-            title: '🆕 New Order Received!',
-            body: `Order ${orderId} - ₹${total} from ${customerDetails.fullName}`,
-          },
-          data: {
-            orderId: orderId,
-            total: total.toString(),
-            customerName: customerDetails.fullName,
-            type: 'new_order'
-          },
+          notification: { title: '🆕 New Order Received!', body: `Order ${orderId} - ₹${total} from ${customerDetails.fullName}` },
+          data: { orderId, total: total.toString(), customerName: customerDetails.fullName, type: 'new_order' },
           token: adminToken,
         };
         await admin.messaging().send(adminMessage);
         console.log('✅ Admin notification sent for new order');
-      } else {
-        console.log('⚠️ Admin notification not sent - missing FCM token or Firebase config');
       }
     } catch (notificationError) {
       console.error('⚠️ Failed to send admin notification:', notificationError.message, notificationError.stack);
     }
-    
+
     res.status(201).json({ message: '✅ Order placed successfully', orderId });
   } catch (error) {
     console.error('❌ Order placement error:', error.message, error.stack);
@@ -587,19 +470,14 @@ app.post('/api/orders/place', async (req, res) => {
   }
 });
 
-// ✅ Admin Login Route
 app.post('/api/admin/login', (req, res) => {
   const { username, password } = req.body;
-  if (
-    username === process.env.ADMIN_USERNAME &&
-    password === process.env.ADMIN_PASSWORD
-  ) {
+  if (username === process.env.ADMIN_USERNAME && password === process.env.ADMIN_PASSWORD) {
     return res.json({ success: true, token: "admin-auth-token" });
   }
   return res.status(401).json({ success: false, error: 'Invalid credentials' });
 });
 
-// ✅ GET: Analytics
 app.get('/api/analytics', apicache.middleware('2 minutes'), async (req, res) => {
   try {
     const { date } = req.query;
@@ -622,67 +500,44 @@ app.get('/api/analytics', apicache.middleware('2 minutes'), async (req, res) => 
     }, 0);
     res.json({ totalOrders, totalRevenue });
   } catch (error) {
-    console.error("❌ Analytics fetch error:", error.message, error.stack);
-    res.status(500).json({ error: "Failed to fetch analytics" });
+    console.error('❌ Analytics fetch error:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to fetch analytics' });
   }
 });
 
-// ✅ PATCH: Update Order Status and Transport Details
-// Order Status Flow: confirmed → payment_verified → booked
-// - confirmed: Order placed, waiting for payment verification
-// - payment_verified: Payment screenshot verified by admin  
-// - booked: Order booked for delivery with transport details
 app.patch('/api/orders/update-status/:orderId', async (req, res) => {
   try {
     const { orderId } = req.params;
     const { status, transportName, lrNumber } = req.body;
-    // Handle status updates with proper flow validation
     let updateFields = {};
     if (transportName || lrNumber) {
       updateFields.transportName = transportName || '';
       updateFields.lrNumber = lrNumber || '';
       updateFields.status = 'booked';
     } else if (status) {
-      // Validate status transitions
       const currentOrder = await Order.findOne({ orderId });
-      if (!currentOrder) {
-        return res.status(404).json({ error: "Order not found." });
-      }
-      
-      const currentStatus = currentOrder.status;
+      if (!currentOrder) return res.status(404).json({ error: 'Order not found' });
       const validTransitions = {
         'confirmed': ['payment_verified', 'booked'],
         'payment_verified': ['booked'],
-        'booked': ['booked'] // Can stay booked
+        'booked': ['booked']
       };
-      
-      if (!validTransitions[currentStatus] || !validTransitions[currentStatus].includes(status)) {
-        return res.status(400).json({ 
-          error: `Invalid status transition from '${currentStatus}' to '${status}'. Valid transitions: ${validTransitions[currentStatus].join(', ')}` 
-        });
+      if (!validTransitions[currentOrder.status]?.includes(status)) {
+        return res.status(400).json({ error: `Invalid status transition from '${currentOrder.status}' to '${status}'` });
       }
-      
       updateFields.status = status;
     } else {
-      return res.status(400).json({ error: "Status or transport details required." });
+      return res.status(400).json({ error: 'Status or transport details required' });
     }
-    const order = await Order.findOneAndUpdate(
-      { orderId },
-      { $set: updateFields },
-      { new: true }
-    );
-    if (!order) {
-      return res.status(404).json({ error: "Order not found." });
-    }
+    const order = await Order.findOneAndUpdate({ orderId }, { $set: updateFields }, { new: true });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    // Send push notification to customer about order status update
     try {
       const customerUserId = `customer_${order.customerDetails.mobile}`;
       const customerToken = fcmTokens.get(customerUserId);
       if (customerToken && firebaseApp) {
         let notificationTitle = '';
         let notificationBody = '';
-        
         if (updateFields.status === 'confirmed') {
           notificationTitle = '✅ Order Confirmed!';
           notificationBody = `Your order ${orderId} has been confirmed and is being processed.`;
@@ -693,18 +548,10 @@ app.patch('/api/orders/update-status/:orderId', async (req, res) => {
           notificationTitle = '🚚 Order Booked for Delivery!';
           notificationBody = `Your order ${orderId} has been booked for delivery. Transport: ${updateFields.transportName}`;
         }
-        
         if (notificationTitle && notificationBody) {
           const customerMessage = {
-            notification: {
-              title: notificationTitle,
-              body: notificationBody,
-            },
-            data: {
-              orderId: orderId,
-              status: updateFields.status,
-              type: 'order_status_update'
-            },
+            notification: { title: notificationTitle, body: notificationBody },
+            data: { orderId, status: updateFields.status, type: 'order_status_update' },
             token: customerToken,
           };
           await admin.messaging().send(customerMessage);
@@ -715,25 +562,20 @@ app.patch('/api/orders/update-status/:orderId', async (req, res) => {
       console.error('❌ Failed to send customer notification:', notificationError.message, notificationError.stack);
     }
 
-    res.json({ message: "✅ Order updated successfully", order });
+    res.json({ message: '✅ Order updated successfully', order });
   } catch (error) {
-    console.error("❌ Status update error:", error.message, error.stack);
-    res.status(500).json({ error: "Failed to update order status" });
+    console.error('❌ Status update error:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to update order status' });
   }
 });
 
-// ✅ GET: Home Page Products (Optimized for first impression)
 app.get('/api/products/home', apicache.middleware('3 minutes'), async (req, res) => {
   try {
-    // Prioritize Atom Bomb and Sparkler products for home page
     const featuredCategories = ['ATOM_BOMB', 'SPARKLER_ITEMS'];
-    
-    // Fetch products in parallel with limited results for faster loading
     const homeProducts = await Promise.all(
       featuredCategories.map(async (category) => {
         try {
           const ProductModel = getProductModelByCategory(category);
-          // Use lean() for faster plain objects, limit to 6 products per category for better display
           const products = await ProductModel.find({}, {
             name_en: 1,
             name_ta: 1,
@@ -743,35 +585,38 @@ app.get('/api/products/home', apicache.middleware('3 minutes'), async (req, res)
             youtube_url: 1,
             category: 1
           }).limit(6).lean();
-          
-          // Add category name for frontend
-          return products.map(product => ({
-            ...product,
-            category: category.replace(/_/g, ' ')
-          }));
+          return products.map(product => ({ ...product, category: category.replace(/_/g, ' ') }));
         } catch (err) {
           console.warn(`⚠️ Warning: Could not fetch products for category ${category}:`, err.message);
           return [];
         }
       })
     );
-
-    // Flatten and return home page products
-    const allHomeProducts = homeProducts.flat();
-    res.json(allHomeProducts);
+    res.json(homeProducts.flat());
   } catch (error) {
     console.error('❌ Error fetching home page products:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to fetch home page products' });
   }
 });
 
-// ✅ GET: Products by Category (Optimized)
 app.get('/api/products/category/:category', apicache.middleware('2 minutes'), async (req, res) => {
   try {
-    const category = req.params.category;
+    let { category } = req.params;
+    // Normalize category: replace spaces/hyphens with underscores, convert to uppercase
+    category = category
+      .replace(/%20/g, '_')
+      .replace(/ /g, '_')
+      .replace(/-/g, '_')
+      .toUpperCase();
+    // Validate category against known collections
+    const collections = await mongoose.connection.db.listCollections().toArray();
+    const validCollections = collections
+      .map(c => c.name)
+      .filter(name => /^[A-Z0-9_]+$/.test(name));
+    if (!validCollections.includes(category)) {
+      return res.status(404).json({ error: `Category ${category} not found` });
+    }
     const ProductModel = getProductModelByCategory(category);
-    
-    // Use lean() for faster plain objects, project only needed fields
     const products = await ProductModel.find({}, {
       name_en: 1,
       name_ta: 1,
@@ -781,34 +626,22 @@ app.get('/api/products/category/:category', apicache.middleware('2 minutes'), as
       youtube_url: 1,
       category: 1
     }).lean();
-    
-    // Add category name for frontend
-    const productsWithCategory = products.map(product => ({
-      ...product,
-      category: category.replace(/_/g, ' ')
-    }));
-    
-    res.json(productsWithCategory);
+    res.json(products.map(product => ({ ...product, category: category.replace(/_/g, ' ') })));
   } catch (error) {
-    console.error('❌ Error fetching category products:', error.message, error.stack);
+    console.error(`❌ Error fetching category products for ${req.params.category}:`, error.message, error.stack);
     res.status(500).json({ error: 'Failed to fetch products by category' });
   }
 });
 
-// ✅ GET: All Products across all categories (Optimized with better caching and limits)
 app.get('/api/products/all', apicache.middleware('5 minutes'), async (req, res) => {
   try {
+    const { page = 1, limit = 50 } = req.query;
     const collections = await mongoose.connection.db.listCollections().toArray();
-    const categoryCollectionNames = collections
-      .map((c) => c.name)
-      .filter((name) => /^[A-Z0-9_]+$/.test(name));
-
-    // Fetch all collections in parallel with optimized queries and limits
+    const categoryCollectionNames = collections.map(c => c.name).filter(name => /^[A-Z0-9_]+$/.test(name));
     const allProductsArrays = await Promise.all(
       categoryCollectionNames.map(async (collectionName) => {
         try {
           const Model = mongoose.model(collectionName, productSchema, collectionName);
-          // Use lean() for faster plain objects, project only needed fields, limit to 100 per category
           const docs = await Model.find({}, {
             name_en: 1,
             name_ta: 1,
@@ -816,35 +649,28 @@ app.get('/api/products/all', apicache.middleware('5 minutes'), async (req, res) 
             original_price: 1,
             imageUrl: 1,
             youtube_url: 1,
-          }).limit(100).lean();
-          
-          const category = collectionName.replace(/_/g, ' ');
-          return docs.map((doc) => ({ ...doc, category }));
+          }).skip((Number(page) - 1) * Number(limit)).limit(Number(limit)).lean();
+          return docs.map(doc => ({ ...doc, category: collectionName.replace(/_/g, ' ') }));
         } catch (err) {
           console.warn(`⚠️ Warning: Could not fetch products for collection ${collectionName}:`, err.message);
           return [];
         }
       })
     );
-
-    const allProducts = [].concat(...allProductsArrays);
-    res.json(allProducts);
+    res.json(allProductsArrays.flat());
   } catch (error) {
     console.error('❌ Error fetching all products:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to fetch all products' });
   }
 });
 
-// ✅ DELETE: Delete Product by ID
 app.delete('/api/products/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    // Search all category collections for the product
     const collections = await mongoose.connection.db.listCollections().toArray();
     let deleted = false;
     for (const col of collections) {
       const modelName = col.name;
-      // Only check collections that match the category naming pattern
       if (/^[A-Z0-9_]+$/.test(modelName)) {
         const Model = mongoose.model(modelName, productSchema, modelName);
         const result = await Model.findByIdAndDelete(id);
@@ -865,14 +691,10 @@ app.delete('/api/products/:id', async (req, res) => {
   }
 });
 
-// ✅ FCM Token Registration
 app.post('/api/notifications/register-token', async (req, res) => {
   try {
     const { token, userId } = req.body;
-    if (!token) {
-      return res.status(400).json({ error: 'FCM token is required' });
-    }
-    
+    if (!token) return res.status(400).json({ error: 'FCM token is required' });
     fcmTokens.set(userId, token);
     console.log(`✅ FCM token registered for user: ${userId}`);
     res.json({ message: 'Token registered successfully' });
@@ -882,29 +704,17 @@ app.post('/api/notifications/register-token', async (req, res) => {
   }
 });
 
-// ✅ Send Push Notification
 app.post('/api/notifications/send', async (req, res) => {
   try {
+    if (!firebaseApp) return res.status(500).json({ error: 'Firebase Admin not initialized' });
     const { title, body, userId, data } = req.body;
-    
-    if (!firebaseApp) {
-      return res.status(500).json({ error: 'Firebase Admin not initialized' });
-    }
-    
     const token = fcmTokens.get(userId);
-    if (!token) {
-      return res.status(404).json({ error: 'User token not found' });
-    }
-    
+    if (!token) return res.status(404).json({ error: 'User token not found' });
     const message = {
-      notification: {
-        title: title || 'KMPyrotech',
-        body: body || 'You have a new notification',
-      },
+      notification: { title: title || 'KMPyrotech', body: body || 'You have a new notification' },
       data: data || {},
-      token: token,
+      token,
     };
-    
     const response = await admin.messaging().send(message);
     console.log('✅ Push notification sent:', response);
     res.json({ message: 'Notification sent successfully', messageId: response });
@@ -914,79 +724,30 @@ app.post('/api/notifications/send', async (req, res) => {
   }
 });
 
-// ✅ Send Notification to All Users
 app.post('/api/notifications/send-to-all', async (req, res) => {
   try {
+    if (!firebaseApp) return res.status(500).json({ error: 'Firebase Admin not initialized' });
     const { title, body, data } = req.body;
-    
-    if (!firebaseApp) {
-      return res.status(500).json({ error: 'Firebase Admin not initialized' });
-    }
-    
     const tokens = Array.from(fcmTokens.values());
-    if (tokens.length === 0) {
-      return res.status(404).json({ error: 'No registered tokens found' });
-    }
-    
+    if (tokens.length === 0) return res.status(404).json({ error: 'No registered tokens found' });
     const message = {
-      notification: {
-        title: title || 'KMPyrotech',
-        body: body || 'You have a new notification',
-      },
+      notification: { title: title || 'KMPyrotech', body: body || 'You have a new notification' },
       data: data || {},
-      tokens: tokens,
+      tokens,
     };
-    
     const response = await admin.messaging().sendMulticast(message);
     console.log('✅ Multicast notification sent:', response);
-    res.json({ 
-      message: 'Notifications sent successfully', 
-      successCount: response.successCount,
-      failureCount: response.failureCount
-    });
+    res.json({ message: 'Notifications sent successfully', successCount: response.successCount, failureCount: response.failureCount });
   } catch (error) {
     console.error('❌ Error sending multicast notification:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to send notifications' });
   }
 });
 
-// ✅ Get Registered Tokens Count
 app.get('/api/notifications/tokens-count', (req, res) => {
   res.json({ count: fcmTokens.size });
 });
 
-// Performance monitoring middleware
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on('finish', () => {
-    const duration = Date.now() - start;
-    console.log(`📊 ${req.method} ${req.path} - ${res.statusCode} - ${duration}ms`);
-  });
-  next();
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('❌ Server error:', err.message, err.stack);
-  
-  // Handle CORS errors specifically
-  if (err.message && err.message.includes('CORS')) {
-    console.error('🌐 CORS Error Details:', {
-      origin: req.headers.origin,
-      method: req.method,
-      path: req.path,
-      userAgent: req.headers['user-agent']
-    });
-  }
-  
-  res.status(500).json({ 
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong',
-    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
-  });
-});
-
-// ✅ GET: Performance metrics
 app.get('/api/performance', (req, res) => {
   const memory = process.memoryUsage();
   res.json({
@@ -1007,49 +768,31 @@ app.get('/api/performance', (req, res) => {
   });
 });
 
-// ✅ Health check endpoint for Railway
-app.get('/health', async (req, res) => {
-  let mongoStatus = 'disconnected';
-  try {
-    await mongoose.connection.db.admin().ping();
-    mongoStatus = 'connected';
-  } catch (err) {
-    console.error('❌ MongoDB health check failed:', err.message, err.stack);
-  }
-  res.json({
-    status: mongoStatus === 'connected' ? 'healthy' : 'unhealthy',
-    timestamp: new Date().toISOString(),
-    cors: 'enabled',
-    allowedOrigins: [
-      'https://www.kmpyrotech.com',
-      'https://kmpyrotech.com',
-      'http://localhost:3000',
-      'http://localhost:5173'
-    ],
-    mongoStatus,
-    uptime: process.uptime(),
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`📊 ${req.method} ${req.path} - ${res.statusCode} - ${duration}ms - Body: ${JSON.stringify(req.body)} - Query: ${JSON.stringify(req.query)}`);
   });
+  next();
 });
 
-// ✅ Test CORS endpoint
-app.get('/api/test-cors', (req, res) => {
-  console.log('🧪 Test CORS endpoint called');
-  console.log('📋 Request headers:', req.headers);
-  res.json({
-    message: 'CORS test successful',
-    timestamp: new Date().toISOString(),
-    origin: req.headers.origin,
-    method: req.method
+app.use((err, req, res, next) => {
+  console.error(`❌ Server error on ${req.method} ${req.path}:`, err.message, err.stack);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong',
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
   });
 });
 
 const PORT = process.env.PORT || 5000;
-mongoose.connect(process.env.MONGODB_URI)
+mongoose.connect(process.env.MONGODB_URI, { retryWrites: true, w: 'majority', retryReads: true, maxPoolSize: 10 })
   .then(() => {
     console.log('✅ MongoDB connected');
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Server is running on port ${PORT}`);
-      console.log(`🌐 CORS enabled for origins: ${corsOptions.origin.join(', ')}`);
+      console.log(`🌐 CORS enabled for origins: ${corsOptions.origin}`);
       console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
       console.log(`📊 Railway deployment: ${process.env.RAILWAY_ENVIRONMENT ? 'Yes' : 'No'}`);
     });
@@ -1059,24 +802,26 @@ mongoose.connect(process.env.MONGODB_URI)
     process.exit(1);
   });
 
-// Performance optimization: Add database indexes for faster queries
 const setupDatabaseIndexes = async () => {
   try {
     const collections = await mongoose.connection.db.listCollections().toArray();
-    const categoryCollectionNames = collections
-      .map((c) => c.name)
-      .filter((name) => /^[A-Z0-9_]+$/.test(name));
-
-    // Create indexes for each category collection
+    const categoryCollectionNames = collections.map(c => c.name).filter(name => /^[A-Z0-9_]+$/.test(name));
     for (const collectionName of categoryCollectionNames) {
       try {
         const collection = mongoose.connection.db.collection(collectionName);
-        await collection.createIndex({ name_en: 1 });
-        console.log(`✅ Index created on name_en for ${collectionName}`);
-        await collection.createIndex({ category: 1 });
-        console.log(`✅ Index created on category for ${collectionName}`);
-        await collection.createIndex({ price: 1 });
-        console.log(`✅ Index created on price for ${collectionName}`);
+        const indexes = await collection.indexes();
+        if (!indexes.some(index => index.key.name_en)) {
+          await collection.createIndex({ name_en: 1 });
+          console.log(`✅ Index created on name_en for ${collectionName}`);
+        }
+        if (!indexes.some(index => index.key.category)) {
+          await collection.createIndex({ category: 1 });
+          console.log(`✅ Index created on category for ${collectionName}`);
+        }
+        if (!indexes.some(index => index.key.price)) {
+          await collection.createIndex({ price: 1 });
+          console.log(`✅ Index created on price for ${collectionName}`);
+        }
       } catch (err) {
         console.warn(`⚠️ Could not create indexes for ${collectionName}:`, err.message);
       }
@@ -1086,7 +831,6 @@ const setupDatabaseIndexes = async () => {
   }
 };
 
-// Call setup function when database connects
 mongoose.connection.once('open', () => {
   console.log('✅ Connected to MongoDB');
   setupDatabaseIndexes();
