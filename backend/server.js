@@ -44,6 +44,7 @@ app.use(compression());
 const allowedOrigins = [
   "https://www.kmpyrotech.com",
   "https://kmpyrotech.com",
+   "https://kmcrackers.vercel.app",
   "http://localhost:5000",
   "http://localhost:5173"
 ];
