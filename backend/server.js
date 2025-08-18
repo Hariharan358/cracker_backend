@@ -46,6 +46,7 @@ const allowedOrigins = [
   "https://kmpyrotech.com",
    "https://kmcrackers.vercel.app",
   "http://localhost:5000",
+  "https://api.kmpyrotech.com",
   "http://localhost:5173"
 ];
 
