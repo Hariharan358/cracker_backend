@@ -498,46 +498,39 @@ app.post('/api/orders/place', async (req, res) => {
       return res.status(400).json({ error: 'Missing required order fields.' });
     }
 
-    // Generate unique order ID on the backend
-    const generateOrderId = async () => {
+    // Generate unique order ID using atomic per-day counter (DDMMYY + 2 digits)
+    const getNextOrderIdForToday = async () => {
       const today = new Date();
-      const dateStr = today.getDate().toString().padStart(2, '0') + 
-                     (today.getMonth() + 1).toString().padStart(2, '0') + 
+      const dateStr = today.getDate().toString().padStart(2, '0') +
+                     (today.getMonth() + 1).toString().padStart(2, '0') +
                      today.getFullYear().toString().slice(-2);
-      
-      // Get the latest order for today to determine the next sequential number
-      const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-      const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
-      
-      const latestOrder = await Order.findOne({
-        createdAt: { $gte: startOfDay, $lte: endOfDay }
-      }).sort({ orderId: -1 });
-      
-      let nextNumber = 1;
-      if (latestOrder && latestOrder.orderId) {
-        // Extract the number from the latest order ID (last 2 digits)
-        const match = latestOrder.orderId.match(/^(\d{8})(\d{2})$/);
-        if (match && match[1] === dateStr) {
-          nextNumber = parseInt(match[2]) + 1;
-        }
-      }
-      
-      // Format as DDMMYYYYNN (date + 2-digit sequential number)
-      return `${dateStr}${nextNumber.toString().padStart(2, '0')}`;
+      // Use a dedicated counters collection to avoid race conditions
+      const counters = mongoose.connection.db.collection('order_counters');
+      const result = await counters.findOneAndUpdate(
+        { _id: dateStr },
+        { $inc: { seq: 1 } },
+        { upsert: true, returnDocument: 'after' }
+      );
+      const seq = (result && result.value && result.value.seq) ? result.value.seq : 1;
+      const suffix = String(seq).padStart(2, '0');
+      return `${dateStr}${suffix}`;
     };
 
+    // Generate a unique order ID with minimal retries (in case of rare collision)
     let orderId;
-    let attempts = 0;
-    const maxAttempts = 10;
-    
-    // Try to generate a unique order ID
-    do {
-      orderId = await generateOrderId();
-      attempts++;
-      if (attempts > maxAttempts) {
-        return res.status(500).json({ error: 'Failed to generate unique order ID' });
+    {
+      let attempts = 0;
+      const maxAttempts = 5;
+      while (true) {
+        orderId = await getNextOrderIdForToday();
+        const exists = await Order.findOne({ orderId });
+        if (!exists) break;
+        attempts++;
+        if (attempts >= maxAttempts) {
+          return res.status(500).json({ error: 'Failed to generate unique order ID' });
+        }
       }
-    } while (await Order.findOne({ orderId }));
+    }
 
     // Always start with 'confirmed' status when order is placed
     const newOrder = new Order({
