@@ -504,6 +504,9 @@ app.post('/api/orders/place', async (req, res) => {
       const dateStr = today.getDate().toString().padStart(2, '0') +
                      (today.getMonth() + 1).toString().padStart(2, '0') +
                      today.getFullYear().toString().slice(-2);
+      
+      console.log('🔢 Generating order ID for date:', dateStr);
+      
       // Use a dedicated counters collection to avoid race conditions
       const counters = mongoose.connection.db.collection('order_counters');
       const result = await counters.findOneAndUpdate(
@@ -511,9 +514,15 @@ app.post('/api/orders/place', async (req, res) => {
         { $inc: { seq: 1 } },
         { upsert: true, returnDocument: 'after' }
       );
+      
+      console.log('🔢 Counter result:', result);
+      
       const seq = (result && result.value && result.value.seq) ? result.value.seq : 1;
       const suffix = String(seq).padStart(2, '0');
-      return `${dateStr}${suffix}`;
+      const orderId = `${dateStr}${suffix}`;
+      
+      console.log('🔢 Generated order ID:', orderId);
+      return orderId;
     };
 
     // Generate a unique order ID with minimal retries (in case of rare collision)
@@ -523,16 +532,23 @@ app.post('/api/orders/place', async (req, res) => {
       const maxAttempts = 5;
       while (true) {
         orderId = await getNextOrderIdForToday();
+        console.log('🔍 Checking if order ID exists:', orderId);
         const exists = await Order.findOne({ orderId });
-        if (!exists) break;
+        if (!exists) {
+          console.log('✅ Order ID is unique:', orderId);
+          break;
+        }
+        console.log('⚠️ Order ID collision detected, retrying...');
         attempts++;
         if (attempts >= maxAttempts) {
+          console.error('❌ Failed to generate unique order ID after', maxAttempts, 'attempts');
           return res.status(500).json({ error: 'Failed to generate unique order ID' });
         }
       }
     }
 
     // Always start with 'confirmed' status when order is placed
+    console.log('📝 Creating new order with ID:', orderId);
     const newOrder = new Order({
       orderId,
       items,
@@ -541,7 +557,10 @@ app.post('/api/orders/place', async (req, res) => {
       status: 'confirmed', // Always start with confirmed
       createdAt: createdAt || new Date().toISOString(),
     });
+    
+    console.log('📝 Order object created, saving to database...');
     await newOrder.save();
+    console.log('✅ Order saved successfully');
     
     // Generate invoice path
     const invoicePath = path.join(invoiceDir, `${orderId}.pdf`);
@@ -597,7 +616,11 @@ app.post('/api/orders/place', async (req, res) => {
     res.status(201).json({ message: '✅ Order placed successfully', orderId });
   } catch (error) {
     console.error('❌ Order placement error:', error);
-    res.status(500).json({ error: 'Failed to place order' });
+    res.status(500).json({ 
+      error: 'Failed to place order', 
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
