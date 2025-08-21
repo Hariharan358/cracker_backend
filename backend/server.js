@@ -136,6 +136,13 @@ const productSchema = new mongoose.Schema({
   category: String,    // Add this field for completeness
 }, { timestamps: true });
 
+// Atomic per-day counter for order IDs
+const orderCounterSchema = new mongoose.Schema({
+  _id: String,   // DDMMYY
+  seq: { type: Number, default: 0 }
+});
+const OrderCounter = mongoose.models.OrderCounter || mongoose.model('OrderCounter', orderCounterSchema, 'order_counters');
+
 function getProductModelByCategory(category) {
   const modelName = category.replace(/\s+/g, '_').toUpperCase();
   if (!modelCache[modelName]) {
@@ -498,7 +505,7 @@ app.post('/api/orders/place', async (req, res) => {
       return res.status(400).json({ error: 'Missing required order fields.' });
     }
 
-    // Generate unique order ID using atomic per-day counter (DDMMYY + 2 digits)
+    // Generate unique order ID using atomic per-day counter (DDMMYY + 3 digits)
     const getNextOrderIdForToday = async () => {
       const today = new Date();
       const dateStr = today.getDate().toString().padStart(2, '0') +
@@ -506,19 +513,14 @@ app.post('/api/orders/place', async (req, res) => {
                      today.getFullYear().toString().slice(-2);
       
       console.log('🔢 Generating order ID for date:', dateStr);
-      
-      // Use a dedicated counters collection to avoid race conditions
-      const counters = mongoose.connection.db.collection('order_counters');
-      const result = await counters.findOneAndUpdate(
+      // Use OrderCounter model to guarantee increment returns across driver versions
+      const counter = await OrderCounter.findOneAndUpdate(
         { _id: dateStr },
         { $inc: { seq: 1 } },
-        { upsert: true, returnDocument: 'after' }
+        { upsert: true, new: true, setDefaultsOnInsert: true }
       );
-      
-      console.log('🔢 Counter result:', result);
-      
-      const seq = (result && result.value && result.value.seq) ? result.value.seq : 1;
-      const suffix = String(seq).padStart(2, '0');
+      const seq = counter?.seq || 1;
+      const suffix = String(seq).padStart(3, '0');
       const orderId = `${dateStr}${suffix}`;
       
       console.log('🔢 Generated order ID:', orderId);
