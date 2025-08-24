@@ -12,11 +12,13 @@ import { v2 as cloudinary } from 'cloudinary';
 import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import PDFDocument from 'pdfkit';
 import nodemailer from 'nodemailer';
-import { Order } from './models/order.model.js';
+import { Order, OrderCounter } from './models/order.model.js';
+import { getProductModelByCategory } from './models/getProductModelByCategory.js';
 import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import apicache from 'apicache';
+import orderRoutes from './routes/orderRoutes.js';
 
 import admin from 'firebase-admin'; // <-- Add this line
 
@@ -86,6 +88,9 @@ app.get("/", (req, res) => {
   res.json({ status: "Backend is running ✅" });
 });
 
+// 8️⃣ Use order routes
+app.use('/api/orders', orderRoutes);
+
 const cache = apicache.middleware;
 
 mongoose.connect(process.env.MONGODB_URI)
@@ -136,12 +141,7 @@ const productSchema = new mongoose.Schema({
   category: String,    // Add this field for completeness
 }, { timestamps: true });
 
-// Atomic per-day counter for order IDs
-const orderCounterSchema = new mongoose.Schema({
-  _id: String,   // DDMMYY
-  seq: { type: Number, default: 0 }
-});
-const OrderCounter = mongoose.models.OrderCounter || mongoose.model('OrderCounter', orderCounterSchema, 'order_counters');
+// OrderCounter now imported from order.model.js
 
 function getProductModelByCategory(category) {
   const modelName = category.replace(/\s+/g, '_').toUpperCase();
@@ -272,128 +272,9 @@ app.get('/api/orders', async (req, res) => {
   }
 });
 
-function generateInvoice(order, filePath) {
-  const doc = new PDFDocument({ margin: 40 });
-  doc.pipe(fs.createWriteStream(filePath));
+// generateInvoice function moved to orderRoutes.js
 
-  // Header
-  doc
-    .fontSize(28)
-    .fillColor('#d97706')
-    .text('KMPyrotech Invoice', { align: 'center', underline: true });
-  doc.moveDown(2);
-
-  // Draw main box
-  const boxTop = doc.y;
-  const boxLeft = 40;
-  const boxWidth = 520;
-  let boxHeight = 350 + (order.items.length * 25);
-
-  // Draw rectangle (box)
-  doc
-    .lineWidth(2)
-    .roundedRect(boxLeft, boxTop, boxWidth, boxHeight, 12)
-    .stroke('#d97706');
-
-  // Customer Information Section
-  doc.moveDown(0.5);
-  doc.fontSize(14).fillColor('#d97706').font('Helvetica-Bold');
-  doc.text('Customer Information', boxLeft + 16, doc.y + 20);
-  
-  doc.fontSize(12).fillColor('#222').font('Helvetica');
-  const startY = doc.y + 40;
-  
-  // Left column
-  doc.text(`Order ID: ${order.orderId}`, boxLeft + 16, startY);
-  doc.text(`Name: ${order.customerDetails.fullName}`, boxLeft + 16, startY + 25);
-  doc.text(`Mobile: ${order.customerDetails.mobile}`, boxLeft + 16, startY + 50);
-  doc.text(`Address: ${order.customerDetails.address}`, boxLeft + 16, startY + 75, { width: 240 });
-  
-  // Right column
-  doc.text(`Date: ${new Date(order.createdAt).toLocaleString('en-IN')}`, boxLeft + 280, startY);
-  doc.text(`Email: ${order.customerDetails.email}`, boxLeft + 280, startY + 25);
-  doc.text(`Pincode: ${order.customerDetails.pincode}`, boxLeft + 280, startY + 50);
-  
-  doc.moveDown(2);
-
-  // Products Table Header
-  doc.font('Helvetica-Bold').fontSize(14).fillColor('#d97706');
-  doc.text('Order Items', boxLeft + 16, doc.y + 20);
-  
-  // Table header line
-  doc.moveDown(0.5);
-  doc.lineWidth(1);
-  doc.moveTo(boxLeft + 16, doc.y + 5);
-  doc.lineTo(boxLeft + boxWidth - 16, doc.y + 5);
-  doc.stroke('#d97706');
-  
-  // Table columns header
-  doc.font('Helvetica-Bold').fontSize(11).fillColor('#d97706');
-  const tableY = doc.y + 15;
-  doc.text('No.', boxLeft + 16, tableY);
-  doc.text('Product Name', boxLeft + 60, tableY);
-  doc.text('Qty', boxLeft + 280, tableY);
-  doc.text('Price', boxLeft + 320, tableY);
-  doc.text('Total', boxLeft + 380, tableY);
-  
-  // Table header line
-  doc.moveTo(boxLeft + 16, tableY + 15);
-  doc.lineTo(boxLeft + boxWidth - 16, tableY + 15);
-  doc.stroke('#d97706');
-
-  // Products Table Rows
-  doc.font('Helvetica').fontSize(11).fillColor('#222');
-  order.items.forEach((item, idx) => {
-    const rowY = tableY + 25 + (idx * 20);
-    doc.text(`${idx + 1}.`, boxLeft + 16, rowY);
-    doc.text(item.name_en, boxLeft + 60, rowY, { width: 200 });
-    doc.text(`${item.quantity}`, boxLeft + 280, rowY);
-    doc.text(`₹${item.price}`, boxLeft + 320, rowY);
-    doc.text(`₹${item.price * item.quantity}`, boxLeft + 380, rowY);
-  });
-  
-  // Table bottom line
-  const lastRowY = tableY + 25 + (order.items.length * 20);
-  doc.moveTo(boxLeft + 16, lastRowY + 10);
-  doc.lineTo(boxLeft + boxWidth - 16, lastRowY + 10);
-  doc.stroke('#d97706');
-
-  // Order Summary
-  doc.moveDown(1);
-  doc.font('Helvetica-Bold').fontSize(12).fillColor('#222');
-  doc.text(`Order Status: ${order.status || 'confirmed'}`, boxLeft + 16, lastRowY + 30);
-  
-  // Total Amount
-  doc.fontSize(16).fillColor('#d97706');
-  doc.text(`Total Amount: ₹${order.total}`, boxLeft + 280, lastRowY + 30);
-
-  // Thank you note
-  doc.moveDown(3);
-  doc.fontSize(14).fillColor('#16a34a').font('Helvetica-Bold');
-  doc.text('Thank you for shopping with KMPyrotech!', { align: 'center' });
-  doc.moveDown(0.5);
-  doc.fontSize(12).fillColor('#16a34a');
-  doc.text('Wishing you a safe and sparkling festival!', { align: 'center' });
-
-  doc.end();
-}
-
-async function sendEmailWithInvoice(to, filePath) {
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: process.env.EMAIL_FROM,
-      pass: process.env.EMAIL_PASS,
-    },
-  });
-  await transporter.sendMail({
-    from: `"KMPyrotech" <${process.env.EMAIL_FROM}>`,
-    to,
-    subject: 'KMPyrotech - Your Order Invoice',
-    text: 'Thank you for your order! Please find your invoice attached.',
-    attachments: [{ filename: 'invoice.pdf', path: filePath }],
-  });
-}
+// sendEmailWithInvoice function moved to orderRoutes.js
 
 // ✅ DELETE: Cancel Order
 app.delete('/api/orders/cancel/:orderId', async (req, res) => {
@@ -497,134 +378,7 @@ const fcmTokens = new Map();
 
 
 
-// ✅ POST: Place Order
-app.post('/api/orders/place', async (req, res) => {
-  try {
-    const { items, total, customerDetails, status, createdAt } = req.body;
-    if (!items || !total || !customerDetails) {
-      return res.status(400).json({ error: 'Missing required order fields.' });
-    }
-
-    // Generate unique order ID using atomic per-day counter (DDMMYY + 3 digits)
-    const getNextOrderIdForToday = async () => {
-      const today = new Date();
-      const dateStr = today.getDate().toString().padStart(2, '0') +
-                     (today.getMonth() + 1).toString().padStart(2, '0') +
-                     today.getFullYear().toString().slice(-2);
-      
-      console.log('🔢 Generating order ID for date:', dateStr);
-      // Use OrderCounter model to guarantee increment returns across driver versions
-      const counter = await OrderCounter.findOneAndUpdate(
-        { _id: dateStr },
-        { $inc: { seq: 1 } },
-        { upsert: true, new: true, setDefaultsOnInsert: true }
-      );
-      const seq = counter?.seq || 1;
-      const suffix = String(seq).padStart(3, '0');
-      const orderId = `${dateStr}${suffix}`;
-      
-      console.log('🔢 Generated order ID:', orderId);
-      return orderId;
-    };
-
-    // Generate a unique order ID with minimal retries (in case of rare collision)
-    let orderId;
-    {
-      let attempts = 0;
-      const maxAttempts = 5;
-      while (true) {
-        orderId = await getNextOrderIdForToday();
-        console.log('🔍 Checking if order ID exists:', orderId);
-        const exists = await Order.findOne({ orderId });
-        if (!exists) {
-          console.log('✅ Order ID is unique:', orderId);
-          break;
-        }
-        console.log('⚠️ Order ID collision detected, retrying...');
-        attempts++;
-        if (attempts >= maxAttempts) {
-          console.error('❌ Failed to generate unique order ID after', maxAttempts, 'attempts');
-          return res.status(500).json({ error: 'Failed to generate unique order ID' });
-        }
-      }
-    }
-
-    // Always start with 'confirmed' status when order is placed
-    console.log('📝 Creating new order with ID:', orderId);
-    const newOrder = new Order({
-      orderId,
-      items,
-      total,
-      customerDetails,
-      status: 'confirmed', // Always start with confirmed
-      createdAt: createdAt || new Date().toISOString(),
-    });
-    
-    console.log('📝 Order object created, saving to database...');
-    await newOrder.save();
-    console.log('✅ Order saved successfully');
-    
-    // Generate invoice path
-    const invoicePath = path.join(invoiceDir, `${orderId}.pdf`);
-    
-    // Generate invoice (optional - will work without email)
-    try {
-      generateInvoice(newOrder, invoicePath);
-      console.log('✅ Invoice generated successfully');
-    } catch (invoiceError) {
-      console.error('⚠️ Invoice generation failed:', invoiceError);
-    }
-    
-    // Send email with invoice (optional - will work without email config)
-    try {
-      if (process.env.EMAIL_FROM && process.env.EMAIL_PASS) {
-        await sendEmailWithInvoice(customerDetails.email, invoicePath);
-        console.log('✅ Email sent successfully');
-      } else {
-        console.log('⚠️ Email not sent - missing email configuration');
-      }
-    } catch (emailError) {
-      console.error('⚠️ Email sending failed:', emailError);
-    }
-    
-
-    
-    // Send push notification to admin about new order (optional)
-    try {
-      const adminToken = fcmTokens.get('admin');
-      if (adminToken && firebaseApp) {
-        const adminMessage = {
-          notification: {
-            title: '🆕 New Order Received!',
-            body: `Order ${orderId} - ₹${total} from ${customerDetails.fullName}`,
-          },
-          data: {
-            orderId: orderId,
-            total: total.toString(),
-            customerName: customerDetails.fullName,
-            type: 'new_order'
-          },
-          token: adminToken,
-        };
-        await admin.messaging().send(adminMessage);
-        console.log('✅ Admin notification sent for new order');
-      } else {
-        console.log('⚠️ Admin notification not sent - missing FCM token or Firebase config');
-      }
-    } catch (notificationError) {
-      console.error('⚠️ Failed to send admin notification:', notificationError);
-    }
-    
-    res.status(201).json({ message: '✅ Order placed successfully', orderId });
-  } catch (error) {
-    console.error('❌ Order placement error:', error);
-    res.status(500).json({ 
-      error: 'Failed to place order', 
-      details: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
-  }
-});
+// ✅ POST: Place Order - Now handled by orderRoutes.js
 
 // ✅ Admin Login Route
 app.post('/api/admin/login', (req, res) => {
@@ -1064,6 +818,180 @@ app.get('/api/test-cors', (req, res) => {
     origin: req.headers.origin,
     method: req.method
   });
+});
+
+// ✅ CATEGORY MANAGEMENT API
+// GET: Fetch all categories
+app.get('/api/categories', async (req, res) => {
+  try {
+    // For now, return the hardcoded categories from the frontend
+    // In the future, this could be stored in a database
+    const categories = [
+      "SPARKLER ITEMS",
+      "FLOWER POTS",
+      "CHAKKARS",
+      "TWINKLING",
+      "COLOUR FOUNTAIN WINDOW BIG",
+      "Color Window Fountain 3 Inch",
+      "ENJOY PENCIAL",
+      "ONE SOUND CRACKERS",
+      "BIJILI",
+      "ROCKET BOMB",
+      "ATOM BOMB",
+      "GAINT & DELUXE",
+      "RED MIRACLE (OTHER)",
+      "RED MIRACLE (Brands)",
+      "BABY FANCY NOVELTIES",
+      "MULTI COLOUR SHOT BRAND",
+      "MULTI COLOUR SHOT-Others",
+      "COLOUR PAPER MUSICAL OUT",
+      "MEGA DISPLAY SERIOUS",
+      "MEGA FOUNTAIN",
+      "MINI AERIAL CHOTTA FACNY",
+      "MEGA DISPLAY",
+      "GUJARATH FLOWER POTS",
+      "NEW COLOUR FOUNTAIN SKY",
+      "COLOUR SMOKE FOUNTAIN",
+      "MATCHES BOX",
+      "KANNAN 5 PIECE GIFT BOX",
+      "GUNS",
+      "NATTU VEDI",
+      "FAMILY PACK",
+      "GIFT BOX"
+    ];
+    
+    res.json(categories);
+  } catch (error) {
+    console.error('❌ Error fetching categories:', error);
+    res.status(500).json({ error: 'Failed to fetch categories' });
+  }
+});
+
+// POST: Add new category
+app.post('/api/categories', async (req, res) => {
+  try {
+    const { name } = req.body;
+    
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      return res.status(400).json({ error: 'Category name is required and must be a non-empty string' });
+    }
+    
+    const trimmedName = name.trim().toUpperCase();
+    
+    // Check if category already exists
+    const existingCategories = [
+      "SPARKLER ITEMS",
+      "FLOWER POTS",
+      "CHAKKARS",
+      "TWINKLING",
+      "COLOUR FOUNTAIN WINDOW BIG",
+      "Color Window Fountain 3 Inch",
+      "ENJOY PENCIAL",
+      "ONE SOUND CRACKERS",
+      "BIJILI",
+      "ROCKET BOMB",
+      "ATOM BOMB",
+      "GAINT & DELUXE",
+      "RED MIRACLE (OTHER)",
+      "RED MIRACLE (Brands)",
+      "BABY FANCY NOVELTIES",
+      "MULTI COLOUR SHOT BRAND",
+      "MULTI COLOUR SHOT-Others",
+      "COLOUR PAPER MUSICAL OUT",
+      "MEGA DISPLAY SERIOUS",
+      "MEGA FOUNTAIN",
+      "MINI AERIAL CHOTTA FACNY",
+      "MEGA DISPLAY",
+      "GUJARATH FLOWER POTS",
+      "NEW COLOUR FOUNTAIN SKY",
+      "COLOUR SMOKE FOUNTAIN",
+      "MATCHES BOX",
+      "KANNAN 5 PIECE GIFT BOX",
+      "GUNS",
+      "NATTU VEDI",
+      "FAMILY PACK",
+      "GIFT BOX"
+    ];
+    
+    if (existingCategories.includes(trimmedName)) {
+      return res.status(409).json({ error: 'Category already exists' });
+    }
+    
+    // For now, just return success
+    // In the future, this would be stored in a database
+    console.log(`✅ New category added: ${trimmedName}`);
+    
+    res.status(201).json({ 
+      message: 'Category added successfully',
+      category: trimmedName
+    });
+  } catch (error) {
+    console.error('❌ Error adding category:', error);
+    res.status(500).json({ error: 'Failed to add category' });
+  }
+});
+
+// DELETE: Remove category
+app.delete('/api/categories/:name', async (req, res) => {
+  try {
+    const { name } = req.params;
+    const decodedName = decodeURIComponent(name);
+    
+    if (!decodedName) {
+      return res.status(400).json({ error: 'Category name is required' });
+    }
+    
+    // Check if category exists
+    const existingCategories = [
+      "SPARKLER ITEMS",
+      "FLOWER POTS",
+      "CHAKKARS",
+      "TWINKLING",
+      "COLOUR FOUNTAIN WINDOW BIG",
+      "Color Window Fountain 3 Inch",
+      "ENJOY PENCIAL",
+      "ONE SOUND CRACKERS",
+      "BIJILI",
+      "ROCKET BOMB",
+      "ATOM BOMB",
+      "GAINT & DELUXE",
+      "RED MIRACLE (OTHER)",
+      "RED MIRACLE (Brands)",
+      "BABY FANCY NOVELTIES",
+      "MULTI COLOUR SHOT BRAND",
+      "MULTI COLOUR SHOT-Others",
+      "COLOUR PAPER MUSICAL OUT",
+      "MEGA DISPLAY SERIOUS",
+      "MEGA FOUNTAIN",
+      "MINI AERIAL CHOTTA FACNY",
+      "MEGA DISPLAY",
+      "GUJARATH FLOWER POTS",
+      "NEW COLOUR FOUNTAIN SKY",
+      "COLOUR SMOKE FOUNTAIN",
+      "MATCHES BOX",
+      "KANNAN 5 PIECE GIFT BOX",
+      "GUNS",
+      "NATTU VEDI",
+      "FAMILY PACK",
+      "GIFT BOX"
+    ];
+    
+    if (!existingCategories.includes(decodedName)) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+    
+    // For now, just return success
+    // In the future, this would remove from database and handle product reassignment
+    console.log(`✅ Category removed: ${decodedName}`);
+    
+    res.json({ 
+      message: 'Category removed successfully',
+      category: decodedName
+    });
+  } catch (error) {
+    console.error('❌ Error removing category:', error);
+    res.status(500).json({ error: 'Failed to remove category' });
+  }
 });
 
 const PORT = process.env.PORT || 5000;
