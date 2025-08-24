@@ -14,6 +14,7 @@ import PDFDocument from 'pdfkit';
 import nodemailer from 'nodemailer';
 import { Order } from './models/order.model.js';
 import { getProductModelByCategory } from './models/getProductModelByCategory.js';
+import { Category } from './models/category.model.js';
 import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
@@ -807,43 +808,15 @@ app.get('/api/test-cors', (req, res) => {
 // GET: Fetch all categories
 app.get('/api/categories', async (req, res) => {
   try {
-    // For now, return the hardcoded categories from the frontend
-    // In the future, this could be stored in a database
-    const categories = [
-      "SPARKLER ITEMS",
-      "FLOWER POTS",
-      "CHAKKARS",
-      "TWINKLING",
-      "COLOUR FOUNTAIN WINDOW BIG",
-      "Color Window Fountain 3 Inch",
-      "ENJOY PENCIAL",
-      "ONE SOUND CRACKERS",
-      "BIJILI",
-      "ROCKET BOMB",
-      "ATOM BOMB",
-      "GAINT & DELUXE",
-      "RED MIRACLE (OTHER)",
-      "RED MIRACLE (Brands)",
-      "BABY FANCY NOVELTIES",
-      "MULTI COLOUR SHOT BRAND",
-      "MULTI COLOUR SHOT-Others",
-      "COLOUR PAPER MUSICAL OUT",
-      "MEGA DISPLAY SERIOUS",
-      "MEGA FOUNTAIN",
-      "MINI AERIAL CHOTTA FACNY",
-      "MEGA DISPLAY",
-      "GUJARATH FLOWER POTS",
-      "NEW COLOUR FOUNTAIN SKY",
-      "COLOUR SMOKE FOUNTAIN",
-      "MATCHES BOX",
-      "KANNAN 5 PIECE GIFT BOX",
-      "GUNS",
-      "NATTU VEDI",
-      "FAMILY PACK",
-      "GIFT BOX"
-    ];
+    const categories = await Category.find({ isActive: true })
+      .sort({ name: 1 })
+      .select('name displayName description isActive createdAt')
+      .lean();
     
-    res.json(categories);
+    // Extract just the names for backward compatibility
+    const categoryNames = categories.map(cat => cat.name);
+    
+    res.json(categoryNames);
   } catch (error) {
     console.error('❌ Error fetching categories:', error);
     res.status(500).json({ error: 'Failed to fetch categories' });
@@ -861,48 +834,21 @@ app.post('/api/categories', async (req, res) => {
     
     const trimmedName = name.trim().toUpperCase();
     
-    // Check if category already exists
-    const existingCategories = [
-      "SPARKLER ITEMS",
-      "FLOWER POTS",
-      "CHAKKARS",
-      "TWINKLING",
-      "COLOUR FOUNTAIN WINDOW BIG",
-      "Color Window Fountain 3 Inch",
-      "ENJOY PENCIAL",
-      "ONE SOUND CRACKERS",
-      "BIJILI",
-      "ROCKET BOMB",
-      "ATOM BOMB",
-      "GAINT & DELUXE",
-      "RED MIRACLE (OTHER)",
-      "RED MIRACLE (Brands)",
-      "BABY FANCY NOVELTIES",
-      "MULTI COLOUR SHOT BRAND",
-      "MULTI COLOUR SHOT-Others",
-      "COLOUR PAPER MUSICAL OUT",
-      "MEGA DISPLAY SERIOUS",
-      "MEGA FOUNTAIN",
-      "MINI AERIAL CHOTTA FACNY",
-      "MEGA DISPLAY",
-      "GUJARATH FLOWER POTS",
-      "NEW COLOUR FOUNTAIN SKY",
-      "COLOUR SMOKE FOUNTAIN",
-      "MATCHES BOX",
-      "KANNAN 5 PIECE GIFT BOX",
-      "GUNS",
-      "NATTU VEDI",
-      "FAMILY PACK",
-      "GIFT BOX"
-    ];
-    
-    if (existingCategories.includes(trimmedName)) {
+    // Check if category already exists in database
+    const existingCategory = await Category.findOne({ name: trimmedName });
+    if (existingCategory) {
       return res.status(409).json({ error: 'Category already exists' });
     }
     
-    // For now, just return success
-    // In the future, this would be stored in a database
-    console.log(`✅ New category added: ${trimmedName}`);
+    // Create new category in database
+    const newCategory = new Category({
+      name: trimmedName,
+      displayName: name.trim(),
+      isActive: true
+    });
+    
+    await newCategory.save();
+    console.log(`✅ New category added to database: ${trimmedName}`);
     
     res.status(201).json({ 
       message: 'Category added successfully',
@@ -924,8 +870,83 @@ app.delete('/api/categories/:name', async (req, res) => {
       return res.status(400).json({ error: 'Category name is required' });
     }
     
-    // Check if category exists
-    const existingCategories = [
+    // Check if category exists in database
+    const existingCategory = await Category.findOne({ name: decodedName });
+    if (!existingCategory) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+    
+    // Soft delete by setting isActive to false
+    // This preserves existing products and prevents data loss
+    await Category.findOneAndUpdate(
+      { name: decodedName },
+      { isActive: false, updatedAt: new Date() }
+    );
+    
+    console.log(`✅ Category deactivated: ${decodedName}`);
+    
+    res.json({ 
+      message: 'Category removed successfully',
+      category: decodedName
+    });
+  } catch (error) {
+    console.error('❌ Error removing category:', error);
+    res.status(500).json({ error: 'Failed to remove category' });
+  }
+});
+
+// GET: Get detailed category information with product counts
+app.get('/api/categories/detailed', async (req, res) => {
+  try {
+    const categories = await Category.find({ isActive: true })
+      .sort({ name: 1 })
+      .lean();
+    
+    // Get product counts for each category
+    const categoriesWithCounts = await Promise.all(
+      categories.map(async (category) => {
+        try {
+          const ProductModel = getProductModelByCategory(category.name);
+          const count = await ProductModel.countDocuments();
+          return {
+            name: category.name,
+            displayName: category.displayName,
+            description: category.description,
+            productCount: count,
+            createdAt: category.createdAt
+          };
+        } catch (err) {
+          return {
+            name: category.name,
+            displayName: category.displayName,
+            description: category.description,
+            productCount: 0,
+            createdAt: category.createdAt
+          };
+        }
+      })
+    );
+    
+    res.json(categoriesWithCounts);
+  } catch (error) {
+    console.error('❌ Error fetching detailed categories:', error);
+    res.status(500).json({ error: 'Failed to fetch detailed categories' });
+  }
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server is running on port ${PORT}`);
+  console.log(`🌐 CORS enabled for origins: https://www.kmpyrotech.com, https://kmpyrotech.com`);
+  console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📊 Railway deployment: ${process.env.RAILWAY_ENVIRONMENT ? 'Yes' : 'No'}`);
+});
+
+
+// Initialize default categories
+const initializeDefaultCategories = async () => {
+  try {
+    const defaultCategories = [
       "SPARKLER ITEMS",
       "FLOWER POTS",
       "CHAKKARS",
@@ -958,33 +979,27 @@ app.delete('/api/categories/:name', async (req, res) => {
       "FAMILY PACK",
       "GIFT BOX"
     ];
-    
-    if (!existingCategories.includes(decodedName)) {
-      return res.status(404).json({ error: 'Category not found' });
+
+    for (const categoryName of defaultCategories) {
+      try {
+        await Category.findOneAndUpdate(
+          { name: categoryName.toUpperCase() },
+          { 
+            name: categoryName.toUpperCase(),
+            displayName: categoryName,
+            isActive: true
+          },
+          { upsert: true, new: true }
+        );
+      } catch (err) {
+        console.warn(`⚠️ Could not initialize category ${categoryName}:`, err.message);
+      }
     }
-    
-    // For now, just return success
-    // In the future, this would remove from database and handle product reassignment
-    console.log(`✅ Category removed: ${decodedName}`);
-    
-    res.json({ 
-      message: 'Category removed successfully',
-      category: decodedName
-    });
+    console.log('✅ Default categories initialized');
   } catch (error) {
-    console.error('❌ Error removing category:', error);
-    res.status(500).json({ error: 'Failed to remove category' });
+    console.warn('⚠️ Category initialization failed:', error.message);
   }
-});
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
-  console.log(`🌐 CORS enabled for origins: https://www.kmpyrotech.com, https://kmpyrotech.com`);
-  console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📊 Railway deployment: ${process.env.RAILWAY_ENVIRONMENT ? 'Yes' : 'No'}`);
-});
-
+};
 
 // Performance optimization: Add database indexes for faster queries
 const setupDatabaseIndexes = async () => {
@@ -1015,4 +1030,5 @@ const setupDatabaseIndexes = async () => {
 mongoose.connection.once('open', () => {
   console.log('✅ Connected to MongoDB');
   setupDatabaseIndexes();
+  initializeDefaultCategories();
 });
