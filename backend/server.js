@@ -130,26 +130,9 @@ const storage = new CloudinaryStorage({
 });
 const upload = multer({ storage });
 
-const modelCache = {};
-const productSchema = new mongoose.Schema({
-  name_en: String,
-  name_ta: String,
-  price: Number,
-  original_price: Number, // Add this field
-  imageUrl: String,
-  youtube_url: String, // Add this field
-  category: String,    // Add this field for completeness
-}, { timestamps: true });
+
 
 // OrderCounter now imported from order.model.js
-
-function getProductModelByCategory(category) {
-  const modelName = category.replace(/\s+/g, '_').toUpperCase();
-  if (!modelCache[modelName]) {
-    modelCache[modelName] = mongoose.model(modelName, productSchema, modelName);
-  }
-  return modelCache[modelName];
-}
 
 // ✅ GET: Track Order
 app.get('/api/orders/track', async (req, res) => {
@@ -330,7 +313,7 @@ app.post('/api/products/apply-discount', async (req, res) => {
     for (const col of collections) {
       const modelName = col.name;
       if (/^[A-Z0-9_]+$/.test(modelName)) {
-        const Model = mongoose.model(modelName, productSchema, modelName);
+        const Model = getProductModelByCategory(modelName.replace(/_/g, ' '));
         // Only update products that have an original_price
         const result = await Model.updateMany(
           { original_price: { $exists: true, $ne: null } },
@@ -600,7 +583,7 @@ app.get('/api/products/all', cache('5 minutes'), async (req, res) => {
     const allProductsArrays = await Promise.all(
       categoryCollectionNames.map(async (collectionName) => {
         try {
-          const Model = mongoose.model(collectionName, productSchema, collectionName);
+          const Model = getProductModelByCategory(collectionName.replace(/_/g, ' '));
           // Use lean() for faster plain objects, project only needed fields
           const docs = await Model.find({}, {
             name_en: 1,
@@ -639,7 +622,7 @@ app.delete('/api/products/:id', async (req, res) => {
       const modelName = col.name;
       // Only check collections that match the category naming pattern
       if (/^[A-Z0-9_]+$/.test(modelName)) {
-        const Model = mongoose.model(modelName, productSchema, modelName);
+        const Model = getProductModelByCategory(modelName.replace(/_/g, ' '));
         const result = await Model.findByIdAndDelete(id);
         if (result) {
           deleted = true;
