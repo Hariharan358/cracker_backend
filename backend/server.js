@@ -12,7 +12,7 @@ import { v2 as cloudinary } from 'cloudinary';
 import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import PDFDocument from 'pdfkit';
 import nodemailer from 'nodemailer';
-import { Order, OrderCounter } from './models/order.model.js';
+import { Order } from './models/order.model.js';
 import { getProductModelByCategory } from './models/getProductModelByCategory.js';
 import helmet from 'helmet';
 import compression from 'compression';
@@ -132,7 +132,7 @@ const upload = multer({ storage });
 
 
 
-// OrderCounter now imported from order.model.js
+
 
 // ✅ GET: Track Order
 app.get('/api/orders/track', async (req, res) => {
