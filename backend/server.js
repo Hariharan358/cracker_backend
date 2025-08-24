@@ -895,6 +895,21 @@ app.delete('/api/categories/:name', async (req, res) => {
   }
 });
 
+// GET: Get categories for user side (public)
+app.get('/api/categories/public', async (req, res) => {
+  try {
+    const categories = await Category.find({ isActive: true })
+      .sort({ name: 1 })
+      .select('name displayName')
+      .lean();
+    
+    res.json(categories);
+  } catch (error) {
+    console.error('❌ Error fetching public categories:', error);
+    res.status(500).json({ error: 'Failed to fetch categories' });
+  }
+});
+
 // GET: Get detailed category information with product counts
 app.get('/api/categories/detailed', async (req, res) => {
   try {
