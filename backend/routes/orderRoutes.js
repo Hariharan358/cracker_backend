@@ -1,7 +1,6 @@
 // routes/orderRoutes.js
 import express from "express";
 import { Order } from "../models/order.model.js";
-import { OrderCounter } from "../models/order.model.js";
 import path from 'path';
 import fs from 'fs';
 import PDFDocument from 'pdfkit';
@@ -13,25 +12,29 @@ const __dirname = path.dirname(__filename);
 
 const router = express.Router();
 
-// Generate unique order ID using atomic per-day counter (YYMMDD + 3 digits)
+// Generate unique order ID without OrderCounter dependency (YYMMDD + random 3 digits)
 const getNextOrderIdForToday = async () => {
   const today = new Date();
   const dateStr = today.getFullYear().toString().slice(-2) +
                  (today.getMonth() + 1).toString().padStart(2, '0') +
                  today.getDate().toString().padStart(2, '0');
-  
-  console.log('🔢 Generating order ID for date:', dateStr);
-  const counter = await OrderCounter.findOneAndUpdate(
-    { _id: dateStr },
-    { $inc: { seq: 1 } },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
-  );
-  const seq = counter?.seq || 1;
-  const suffix = String(seq).padStart(3, '0');
-  const orderId = `${dateStr}${suffix}`;
-  
-  console.log('🔢 Generated order ID:', orderId);
-  return orderId;
+
+  let attempt = 0;
+  const maxAttempts = 5;
+  while (attempt < maxAttempts) {
+    const suffix = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
+    const candidate = `${dateStr}${suffix}`;
+    const exists = await Order.findOne({ orderId: candidate }).lean();
+    if (!exists) {
+      console.log('🔢 Generated order ID:', candidate);
+      return candidate;
+    }
+    attempt++;
+  }
+  // Fallback to timestamp-based if collisions persist
+  const fallback = `${dateStr}${(Date.now() % 1000).toString().padStart(3, '0')}`;
+  console.log('🔢 Fallback order ID:', fallback);
+  return fallback;
 };
 
 function generateInvoice(order, filePath) {
@@ -239,4 +242,3 @@ router.post("/place", async (req, res) => {
 });
 
 export default router;
-
