@@ -297,6 +297,83 @@ app.post('/api/products', upload.single('image'), async (req, res) => {
 });
 
 
+// ✅ PUT: Update Product (supports image URL or file upload and category change)
+app.put('/api/products/:id', upload.single('image'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    let { name_en, name_ta, price, original_price, category, youtube_url, imageUrl } = req.body;
+
+    // Coerce numerics if present
+    if (price !== undefined) price = Number(price);
+    if (original_price !== undefined && original_price !== '') original_price = Number(original_price);
+    else if (original_price === '') original_price = undefined;
+
+    // Determine final image URL (prefer uploaded file)
+    const finalImageUrl = req.file?.path || imageUrl;
+
+    // Find the product across all category collections
+    const collections = await mongoose.connection.db.listCollections().toArray();
+    let foundDoc = null;
+    let foundCollectionName = null;
+    for (const col of collections) {
+      const modelName = col.name;
+      if (!/^[A-Z0-9_]+$/.test(modelName)) continue;
+      const Model = getProductModelByCategory(modelName.replace(/_/g, ' '));
+      const doc = await Model.findById(id);
+      if (doc) {
+        foundDoc = doc;
+        foundCollectionName = modelName;
+        break;
+      }
+    }
+
+    if (!foundDoc) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    // If category is changing, move document to new collection
+    const isCategoryChange = category && foundDoc.category !== category;
+    if (isCategoryChange) {
+      // Create in new category collection
+      const NewModel = getProductModelByCategory(category);
+      const newPayload = {
+        name_en: name_en ?? foundDoc.name_en,
+        name_ta: name_ta ?? foundDoc.name_ta,
+        price: price ?? foundDoc.price,
+        original_price: original_price ?? foundDoc.original_price,
+        imageUrl: finalImageUrl ?? foundDoc.imageUrl,
+        youtube_url: youtube_url ?? foundDoc.youtube_url,
+        category, // store plain spaced name for frontend convenience
+        createdAt: foundDoc.createdAt,
+        updatedAt: new Date(),
+      };
+      const created = await NewModel.create(newPayload);
+      // Delete old document
+      const OldModel = getProductModelByCategory(foundCollectionName.replace(/_/g, ' '));
+      await OldModel.findByIdAndDelete(foundDoc._id);
+      return res.json({ message: '✅ Product updated and moved to new category', product: created });
+    } else {
+      // In-place update
+      const updateFields = {};
+      if (name_en !== undefined) updateFields.name_en = name_en;
+      if (name_ta !== undefined) updateFields.name_ta = name_ta;
+      if (price !== undefined) updateFields.price = price;
+      if (original_price !== undefined) updateFields.original_price = original_price;
+      if (finalImageUrl) updateFields.imageUrl = finalImageUrl;
+      if (youtube_url !== undefined) updateFields.youtube_url = youtube_url;
+      if (category !== undefined) updateFields.category = category;
+
+      const Model = getProductModelByCategory(foundCollectionName.replace(/_/g, ' '));
+      const updated = await Model.findByIdAndUpdate(foundDoc._id, { $set: updateFields }, { new: true });
+      return res.json({ message: '✅ Product updated successfully', product: updated });
+    }
+  } catch (error) {
+    console.error('❌ Product PUT error:', error);
+    res.status(500).json({ error: 'Failed to update product' });
+  }
+});
+
+
 
 
 
@@ -360,9 +437,73 @@ try {
 // FCM Token storage (in production, use a database)
 const fcmTokens = new Map();
 
+// Shared simple order creation used by fallback endpoints
+const createOrderSimple = async (payload) => {
+  const { items, total, customerDetails, createdAt } = payload;
+  if (!items || !total || !customerDetails) {
+    const err = new Error('Missing required order fields.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Generate a simple unique order ID (YYMMDD + random 3 digits)
+  const today = new Date();
+  const dateStr = today.getFullYear().toString().slice(-2) +
+                 (today.getMonth() + 1).toString().padStart(2, '0') +
+                 today.getDate().toString().padStart(2, '0');
+  const orderId = `${dateStr}${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`;
+
+  const newOrder = new Order({
+    orderId,
+    items,
+    total,
+    customerDetails,
+    status: 'confirmed',
+    createdAt: createdAt || new Date().toISOString(),
+  });
+
+  await newOrder.save();
+  return orderId;
+};
 
 
-// ✅ POST: Place Order - Now handled by orderRoutes.js
+
+// ✅ POST: Place Order - Direct implementation as backup
+app.post('/api/orders/place', async (req, res) => {
+  try {
+    const orderId = await createOrderSimple(req.body);
+    console.log('✅ Order saved successfully:', orderId);
+    res.status(201).json({ message: '✅ Order placed successfully', orderId });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    console.error('❌ Order placement error:', error);
+    res.status(status).json({ 
+      error: 'Failed to place order', 
+      details: error.message
+    });
+  }
+});
+
+// ✅ POST: Fallback endpoint (some clients may still POST /api/orders)
+app.post('/api/orders', async (req, res) => {
+  try {
+    const orderId = await createOrderSimple(req.body);
+    console.log('✅ Order saved successfully (fallback):', orderId);
+    res.status(201).json({ message: '✅ Order placed successfully', orderId });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    console.error('❌ Fallback order placement error:', error);
+    res.status(status).json({ 
+      error: 'Failed to place order', 
+      details: error.message
+    });
+  }
+});
+
+// ✅ Quick ping to verify orders route availability
+app.get('/api/orders/ping', (req, res) => {
+  res.json({ ok: true, message: 'orders route is live' });
+});
 
 // ✅ Admin Login Route
 app.post('/api/admin/login', (req, res) => {
@@ -556,7 +697,8 @@ app.get('/api/products/category/:category', cache('2 minutes'), async (req, res)
       original_price: 1,
       imageUrl: 1,
       youtube_url: 1,
-      category: 1
+      category: 1,
+      createdAt: 1,
     }).lean();
     
     // Add category name for frontend
@@ -593,6 +735,7 @@ app.get('/api/products/all', cache('5 minutes'), async (req, res) => {
             original_price: 1,
             imageUrl: 1,
             youtube_url: 1,
+            createdAt: 1,
           }).lean();
           
           const category = collectionName.replace(/_/g, ' ');
@@ -860,6 +1003,29 @@ app.post('/api/categories', async (req, res) => {
   }
 });
 
+// PATCH: Edit category display name and optionally rename collection
+app.patch('/api/categories/:name', async (req, res) => {
+  try {
+    const { name } = req.params;
+    const { displayName } = req.body;
+    if (!displayName || typeof displayName !== 'string' || displayName.trim().length === 0) {
+      return res.status(400).json({ error: 'displayName is required' });
+    }
+
+    const decodedName = decodeURIComponent(name);
+    const existing = await Category.findOne({ name: decodedName });
+    if (!existing) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+
+    await Category.updateOne({ name: decodedName }, { $set: { displayName: displayName.trim(), updatedAt: new Date() } });
+    res.json({ message: '✅ Category updated', name: decodedName, displayName: displayName.trim() });
+  } catch (error) {
+    console.error('❌ Error updating category:', error);
+    res.status(500).json({ error: 'Failed to update category' });
+  }
+});
+
 // DELETE: Remove category
 app.delete('/api/categories/:name', async (req, res) => {
   try {
@@ -958,63 +1124,7 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 
-// Initialize default categories
-const initializeDefaultCategories = async () => {
-  try {
-    const defaultCategories = [
-      "SPARKLER ITEMS",
-      "FLOWER POTS",
-      "CHAKKARS",
-      "TWINKLING",
-      "COLOUR FOUNTAIN WINDOW BIG",
-      "Color Window Fountain 3 Inch",
-      "ENJOY PENCIAL",
-      "ONE SOUND CRACKERS",
-      "BIJILI",
-      "ROCKET BOMB",
-      "ATOM BOMB",
-      "GAINT & DELUXE",
-      "RED MIRACLE (OTHER)",
-      "RED MIRACLE (Brands)",
-      "BABY FANCY NOVELTIES",
-      "MULTI COLOUR SHOT BRAND",
-      "MULTI COLOUR SHOT-Others",
-      "COLOUR PAPER MUSICAL OUT",
-      "MEGA DISPLAY SERIOUS",
-      "MEGA FOUNTAIN",
-      "MINI AERIAL CHOTTA FACNY",
-      "MEGA DISPLAY",
-      "GUJARATH FLOWER POTS",
-      "NEW COLOUR FOUNTAIN SKY",
-      "COLOUR SMOKE FOUNTAIN",
-      "MATCHES BOX",
-      "KANNAN 5 PIECE GIFT BOX",
-      "GUNS",
-      "NATTU VEDI",
-      "FAMILY PACK",
-      "GIFT BOX"
-    ];
-
-    for (const categoryName of defaultCategories) {
-      try {
-        await Category.findOneAndUpdate(
-          { name: categoryName.toUpperCase() },
-          { 
-            name: categoryName.toUpperCase(),
-            displayName: categoryName,
-            isActive: true
-          },
-          { upsert: true, new: true }
-        );
-      } catch (err) {
-        console.warn(`⚠️ Could not initialize category ${categoryName}:`, err.message);
-      }
-    }
-    console.log('✅ Default categories initialized');
-  } catch (error) {
-    console.warn('⚠️ Category initialization failed:', error.message);
-  }
-};
+// Removed hardcoded default categories initialization to avoid duplication.
 
 // Performance optimization: Add database indexes for faster queries
 const setupDatabaseIndexes = async () => {
@@ -1045,5 +1155,5 @@ const setupDatabaseIndexes = async () => {
 mongoose.connection.once('open', () => {
   console.log('✅ Connected to MongoDB');
   setupDatabaseIndexes();
-  initializeDefaultCategories();
+  // Default categories are managed client-side (mockData) or via /api/categories endpoints.
 });
