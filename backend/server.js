@@ -104,6 +104,28 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+// Lightweight in-memory TTL cache for fast product responses
+const memoryCache = new Map();
+const getCache = (key) => {
+  const entry = memoryCache.get(key);
+  if (!entry) return null;
+  const { expiresAt, value } = entry;
+  if (Date.now() > expiresAt) {
+    memoryCache.delete(key);
+    return null;
+  }
+  return value;
+};
+const setCache = (key, value, ttlMs) => {
+  memoryCache.set(key, { value, expiresAt: Date.now() + ttlMs });
+};
+const clearCacheByPrefix = (prefix) => {
+  for (const key of memoryCache.keys()) {
+    if (key.startsWith(prefix)) memoryCache.delete(key);
+  }
+};
+const clearAllCache = () => memoryCache.clear();
+
 const invoiceDir = path.join(__dirname, 'invoices');
 if (!fs.existsSync(invoiceDir)) fs.mkdirSync(invoiceDir);
 // Remove static serving of invoices. Use custom endpoint below.
@@ -289,6 +311,8 @@ app.post('/api/products', upload.single('image'), async (req, res) => {
     const ProductModel = getProductModelByCategory(category);
     const newProduct = new ProductModel({ name_en, name_ta, price, original_price, imageUrl: finalImageUrl, youtube_url });
     await newProduct.save();
+    // Invalidate product caches
+    clearCacheByPrefix('products:');
     res.status(201).json({ message: '✅ Product added successfully', product: newProduct });
   } catch (error) {
     console.error('❌ Product POST error:', error);
@@ -351,6 +375,8 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
       // Delete old document
       const OldModel = getProductModelByCategory(foundCollectionName.replace(/_/g, ' '));
       await OldModel.findByIdAndDelete(foundDoc._id);
+      // Invalidate caches
+      clearCacheByPrefix('products:');
       return res.json({ message: '✅ Product updated and moved to new category', product: created });
     } else {
       // In-place update
@@ -365,6 +391,8 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
 
       const Model = getProductModelByCategory(foundCollectionName.replace(/_/g, ' '));
       const updated = await Model.findByIdAndUpdate(foundDoc._id, { $set: updateFields }, { new: true });
+      // Invalidate caches
+      clearCacheByPrefix('products:');
       return res.json({ message: '✅ Product updated successfully', product: updated });
     }
   } catch (error) {
@@ -406,6 +434,8 @@ app.post('/api/products/apply-discount', async (req, res) => {
     } else {
       apicache.clear(); // fallback: clear all cache
     }
+    // Invalidate caches
+    clearCacheByPrefix('products:');
     res.json({ message: `✅ Discount applied to all products.`, updated: totalUpdated });
   } catch (error) {
     console.error('❌ Error applying discount:', error);
@@ -439,9 +469,29 @@ const fcmTokens = new Map();
 
 // Shared simple order creation used by fallback endpoints
 const createOrderSimple = async (payload) => {
-  const { items, total, customerDetails, createdAt } = payload;
-  if (!items || !total || !customerDetails) {
-    const err = new Error('Missing required order fields.');
+  const { items, total, customerDetails, createdAt } = payload || {};
+
+  const errors = [];
+  // items validation
+  if (!Array.isArray(items) || items.length === 0) {
+    errors.push('items must be a non-empty array');
+  }
+  // total validation (coerce to number)
+  const numericTotal = Number(total);
+  if (Number.isNaN(numericTotal) || numericTotal <= 0) {
+    errors.push('total must be a positive number');
+  }
+  // customerDetails validation
+  if (!customerDetails || typeof customerDetails !== 'object') {
+    errors.push('customerDetails is required');
+  } else {
+    if (!customerDetails.fullName) errors.push('customerDetails.fullName is required');
+    if (!customerDetails.mobile) errors.push('customerDetails.mobile is required');
+    if (!customerDetails.address) errors.push('customerDetails.address is required');
+  }
+
+  if (errors.length > 0) {
+    const err = new Error(`Missing/invalid fields: ${errors.join(', ')}`);
     err.statusCode = 400;
     throw err;
   }
@@ -456,7 +506,7 @@ const createOrderSimple = async (payload) => {
   const newOrder = new Order({
     orderId,
     items,
-    total,
+    total: numericTotal,
     customerDetails,
     status: 'confirmed',
     createdAt: createdAt || new Date().toISOString(),
@@ -516,6 +566,21 @@ app.post('/api/admin/login', (req, res) => {
   }
   return res.status(401).json({ success: false, error: 'Invalid credentials' });
 });
+
+// Simple admin auth middleware for protected admin endpoints
+const verifyAdmin = (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+    const validToken = process.env.ADMIN_TOKEN || 'admin-auth-token';
+    if (token && token === validToken) {
+      return next();
+    }
+    return res.status(401).json({ error: 'Unauthorized' });
+  } catch (e) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+};
 
 // ✅ GET: Analytics
 app.get('/api/analytics', cache('2 minutes'), async (req, res) => {
@@ -643,6 +708,12 @@ app.patch('/api/orders/update-status/:orderId', async (req, res) => {
 // ✅ GET: Home Page Products (Optimized for first impression)
 app.get('/api/products/home', cache('3 minutes'), async (req, res) => {
   try {
+    const cacheKey = 'products:home';
+    const cached = getCache(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+      return res.json(cached);
+    }
     // Prioritize Atom Bomb and Sparkler products for home page
     const featuredCategories = ['ATOM_BOMB', 'SPARKLER_ITEMS'];
     
@@ -676,6 +747,8 @@ app.get('/api/products/home', cache('3 minutes'), async (req, res) => {
 
     // Flatten and return home page products
     const allHomeProducts = homeProducts.flat();
+    setCache(cacheKey, allHomeProducts, 60 * 1000);
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
     res.json(allHomeProducts);
   } catch (error) {
     console.error('❌ Error fetching home page products:', error);
@@ -686,10 +759,40 @@ app.get('/api/products/home', cache('3 minutes'), async (req, res) => {
 // ✅ GET: Products by Category (Optimized)
 app.get('/api/products/category/:category', cache('2 minutes'), async (req, res) => {
   try {
-    const category = req.params.category;
-    const ProductModel = getProductModelByCategory(category);
-    
-    // Use lean() for faster plain objects, project only needed fields
+    const rawParam = req.params.category;
+
+    // Resolve to canonical category name from DB (supports ObjectId, name, or displayName)
+    let canonicalName = null;
+    try {
+      const isObjectId = /^[a-f\d]{24}$/i.test(rawParam);
+      if (isObjectId) {
+        const catById = await Category.findById(rawParam).lean();
+        if (catById && catById.isActive) canonicalName = catById.name;
+      }
+      if (!canonicalName) {
+        const upper = decodeURIComponent(rawParam).trim().toUpperCase();
+        // Try by canonical name first
+        let cat = await Category.findOne({ name: upper, isActive: true }).lean();
+        if (!cat) {
+          // Fallback to displayName case-insensitive
+          cat = await Category.findOne({ displayName: { $regex: `^${upper}$`, $options: 'i' }, isActive: true }).lean();
+        }
+        if (cat) canonicalName = cat.name;
+      }
+    } catch (resolveErr) {
+      console.warn('⚠️ Category resolve failed, using raw param:', resolveErr.message);
+    }
+
+    const effectiveCategory = canonicalName || decodeURIComponent(rawParam).trim();
+    const cacheKey = `products:category:${effectiveCategory}`;
+    const cached = getCache(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+      return res.json(cached);
+    }
+
+    const ProductModel = getProductModelByCategory(effectiveCategory);
+
     const products = await ProductModel.find({}, {
       name_en: 1,
       name_ta: 1,
@@ -700,13 +803,14 @@ app.get('/api/products/category/:category', cache('2 minutes'), async (req, res)
       category: 1,
       createdAt: 1,
     }).lean();
-    
-    // Add category name for frontend
+
     const productsWithCategory = products.map(product => ({
       ...product,
-      category: category.replace(/_/g, ' ')
+      category: effectiveCategory.replace(/_/g, ' ')
     }));
-    
+
+    setCache(cacheKey, productsWithCategory, 60 * 1000);
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
     res.json(productsWithCategory);
   } catch (error) {
     console.error('❌ Error fetching category products:', error);
@@ -717,6 +821,12 @@ app.get('/api/products/category/:category', cache('2 minutes'), async (req, res)
 // ✅ GET: All Products across all categories (Optimized with better caching)
 app.get('/api/products/all', cache('5 minutes'), async (req, res) => {
   try {
+    const cacheKey = 'products:all';
+    const cached = getCache(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+      return res.json(cached);
+    }
     const collections = await mongoose.connection.db.listCollections().toArray();
     const categoryCollectionNames = collections
       .map((c) => c.name)
@@ -748,6 +858,8 @@ app.get('/api/products/all', cache('5 minutes'), async (req, res) => {
     );
 
     const allProducts = ([]).concat(...allProductsArrays);
+    setCache(cacheKey, allProducts, 60 * 1000);
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
     res.json(allProducts);
   } catch (error) {
     console.error('❌ Error fetching all products:', error);
@@ -775,6 +887,8 @@ app.delete('/api/products/:id', async (req, res) => {
       }
     }
     if (deleted) {
+      // Invalidate caches
+      clearCacheByPrefix('products:');
       res.status(200).json({ message: '✅ Product deleted successfully', id });
     } else {
       res.status(404).json({ error: 'Product not found' });
@@ -1003,6 +1117,57 @@ app.post('/api/categories', async (req, res) => {
   }
 });
 
+// ADMIN: Create new category
+app.post('/api/admin/categories', verifyAdmin, async (req, res) => {
+  try {
+    const { name, displayName, description } = req.body;
+
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      return res.status(400).json({ error: 'Category name is required and must be a non-empty string' });
+    }
+
+    const normalizedName = name.trim().toUpperCase();
+    const humanDisplayName = (displayName && typeof displayName === 'string' && displayName.trim().length > 0)
+      ? displayName.trim()
+      : name.trim();
+
+    const existingCategory = await Category.findOne({ name: normalizedName });
+    if (existingCategory) {
+      return res.status(409).json({ error: 'Category already exists' });
+    }
+
+    const newCategory = new Category({
+      name: normalizedName,
+      displayName: humanDisplayName,
+      description: typeof description === 'string' ? description : '',
+      isActive: true
+    });
+
+    await newCategory.save();
+
+    // Prepare underlying collection by ensuring the model exists (lazy creation on first use)
+    try {
+      const ProductModel = getProductModelByCategory(normalizedName);
+      await ProductModel.init();
+    } catch (e) {
+      // best-effort; not critical if it fails since collection is created on first insert
+    }
+
+    clearCacheByPrefix('products:');
+
+    return res.status(201).json({
+      message: '✅ Category created successfully',
+      category: {
+        name: normalizedName,
+        displayName: humanDisplayName,
+      }
+    });
+  } catch (error) {
+    console.error('❌ Admin create category error:', error);
+    res.status(500).json({ error: 'Failed to create category' });
+  }
+});
+
 // PATCH: Edit category display name and optionally rename collection
 app.patch('/api/categories/:name', async (req, res) => {
   try {
@@ -1023,6 +1188,74 @@ app.patch('/api/categories/:name', async (req, res) => {
   } catch (error) {
     console.error('❌ Error updating category:', error);
     res.status(500).json({ error: 'Failed to update category' });
+  }
+});
+
+// PATCH: Rename category (changes DB category name and underlying collection)
+app.patch('/api/categories/:name/rename', async (req, res) => {
+  try {
+    const { name } = req.params;
+    const { newName, displayName } = req.body;
+
+    if (!newName || typeof newName !== 'string' || newName.trim().length === 0) {
+      return res.status(400).json({ error: 'newName is required' });
+    }
+
+    const oldName = decodeURIComponent(name).trim().toUpperCase();
+    const normalizedNewName = newName.trim().toUpperCase();
+
+    if (oldName === normalizedNewName) {
+      return res.status(200).json({ message: 'No change: category names are identical', name: oldName });
+    }
+
+    // Ensure old exists
+    const existingOld = await Category.findOne({ name: oldName });
+    if (!existingOld) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+
+    // Ensure new does not already exist
+    const existingNew = await Category.findOne({ name: normalizedNewName });
+    if (existingNew) {
+      return res.status(409).json({ error: 'Target category name already exists' });
+    }
+
+    // Rename underlying collection if present
+    const oldCollectionName = oldName.replace(/\s+/g, '_');
+    const newCollectionName = normalizedNewName.replace(/\s+/g, '_');
+
+    try {
+      const collections = await mongoose.connection.db.listCollections({ name: oldCollectionName }).toArray();
+      if (collections.length > 0) {
+        // Perform atomic rename in MongoDB
+        const oldCollection = mongoose.connection.db.collection(oldCollectionName);
+        await oldCollection.rename(newCollectionName);
+        // Update embedded category field in product docs (best-effort)
+        const newCollection = mongoose.connection.db.collection(newCollectionName);
+        await newCollection.updateMany({}, { $set: { category: normalizedNewName } });
+      }
+    } catch (renameErr) {
+      console.error('❌ Collection rename failed:', renameErr);
+      return res.status(500).json({ error: 'Failed to rename underlying collection', details: renameErr.message });
+    }
+
+    // Update Category document
+    await Category.updateOne(
+      { name: oldName },
+      { $set: { name: normalizedNewName, displayName: (displayName?.trim() || newName.trim()), updatedAt: new Date() } }
+    );
+
+    // Invalidate caches
+    clearCacheByPrefix('products:');
+
+    return res.json({
+      message: '✅ Category renamed successfully',
+      oldName,
+      newName: normalizedNewName,
+    });
+  } catch (error) {
+    console.error('❌ Error renaming category:', error);
+    res.status(500).json({ error: 'Failed to rename category' });
   }
 });
 
