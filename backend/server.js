@@ -1162,10 +1162,25 @@ app.post('/api/admin/categories', verifyAdmin, async (req, res) => {
     }
 
     // Clear category caches
-    if (apicache.clearRegexp) {
-      apicache.clearRegexp(/\/api\/categories/);
+    console.log('🔄 Clearing category caches after creation...');
+    try {
+      // Try multiple cache clearing methods
+      if (apicache.clearRegexp) {
+        const cleared = apicache.clearRegexp(/\/api\/categories/);
+        console.log('✅ API cache cleared with regexp:', cleared);
+      } else if (apicache.clear) {
+        apicache.clear();
+        console.log('✅ API cache cleared completely');
+      } else {
+        console.log('⚠️ No apicache clearing method available');
+      }
+      
+      // Also clear our custom memory cache
+      clearCacheByPrefix('products:');
+      console.log('✅ Memory cache cleared');
+    } catch (cacheError) {
+      console.error('❌ Cache clearing error:', cacheError);
     }
-    clearCacheByPrefix('products:');
 
     return res.status(201).json({
       message: '✅ Category created successfully',
@@ -1202,8 +1217,24 @@ app.patch('/api/categories/:name', async (req, res) => {
     await Category.updateOne({ name: decodedName }, { $set: { displayName: finalDisplayName.trim(), updatedAt: new Date() } });
     
     // Clear category caches
-    if (apicache.clearRegexp) {
-      apicache.clearRegexp(/\/api\/categories/);
+    console.log('🔄 Clearing category caches after update...');
+    try {
+      // Try multiple cache clearing methods
+      if (apicache.clearRegexp) {
+        const cleared = apicache.clearRegexp(/\/api\/categories/);
+        console.log('✅ API cache cleared with regexp:', cleared);
+      } else if (apicache.clear) {
+        apicache.clear();
+        console.log('✅ API cache cleared completely');
+      } else {
+        console.log('⚠️ No apicache clearing method available');
+      }
+      
+      // Also clear our custom memory cache
+      clearCacheByPrefix('products:');
+      console.log('✅ Memory cache cleared');
+    } catch (cacheError) {
+      console.error('❌ Cache clearing error:', cacheError);
     }
     
     res.json({ message: '✅ Category updated', name: decodedName, displayName: finalDisplayName.trim() });
@@ -1305,8 +1336,24 @@ app.delete('/api/categories/:name', async (req, res) => {
     );
     
     // Clear category caches
-    if (apicache.clearRegexp) {
-      apicache.clearRegexp(/\/api\/categories/);
+    console.log('🔄 Clearing category caches after deletion...');
+    try {
+      // Try multiple cache clearing methods
+      if (apicache.clearRegexp) {
+        const cleared = apicache.clearRegexp(/\/api\/categories/);
+        console.log('✅ API cache cleared with regexp:', cleared);
+      } else if (apicache.clear) {
+        apicache.clear();
+        console.log('✅ API cache cleared completely');
+      } else {
+        console.log('⚠️ No apicache clearing method available');
+      }
+      
+      // Also clear our custom memory cache
+      clearCacheByPrefix('products:');
+      console.log('✅ Memory cache cleared');
+    } catch (cacheError) {
+      console.error('❌ Cache clearing error:', cacheError);
     }
     
     console.log(`✅ Category deactivated: ${decodedName}`);
