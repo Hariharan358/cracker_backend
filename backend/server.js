@@ -1338,7 +1338,7 @@ app.post('/api/admin/categories', verifyAdmin, async (req, res) => {
 app.patch('/api/categories/:name', async (req, res) => {
   try {
     const { name } = req.params;
-    const { displayName, displayName_en, displayName_ta, iconUrl } = req.body;
+    const { displayName, displayName_en, displayName_ta, iconUrl, isActive } = req.body;
     
     console.log('🔄 Category update request:', { name, displayName, displayName_en, displayName_ta, iconUrl });
     
@@ -1373,6 +1373,11 @@ app.patch('/api/categories/:name', async (req, res) => {
       console.log('⚠️ No iconUrl provided or empty');
     }
 
+    // Optionally toggle active state if provided
+    if (typeof isActive === 'boolean') {
+      updateData.isActive = isActive;
+    }
+
     await Category.updateOne({ name: decodedName }, { $set: updateData });
     
     // Verify the update
@@ -1404,7 +1409,8 @@ app.patch('/api/categories/:name', async (req, res) => {
       message: '✅ Category updated', 
       name: decodedName, 
       displayName: finalDisplayName.trim(),
-      iconUrl: updatedCategory.iconUrl 
+      iconUrl: updatedCategory.iconUrl,
+      isActive: updatedCategory.isActive
     });
   } catch (error) {
     console.error('❌ Error updating category:', error);
