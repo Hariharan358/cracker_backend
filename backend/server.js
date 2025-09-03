@@ -695,20 +695,7 @@ app.post('/api/admin/login', (req, res) => {
   return res.status(401).json({ success: false, error: 'Invalid credentials' });
 });
 
-// Simple admin auth middleware for protected admin endpoints
-const verifyAdmin = (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
-    const validToken = process.env.ADMIN_TOKEN || 'admin-auth-token';
-    if (token && token === validToken) {
-      return next();
-    }
-    return res.status(401).json({ error: 'Unauthorized' });
-  } catch (e) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-};
+// (verifyAdmin defined earlier)
 
 // ✅ GET: Analytics
 app.get('/api/analytics', cache('2 minutes'), async (req, res) => {
