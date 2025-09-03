@@ -107,6 +107,21 @@ if (!fs.existsSync(categoryIconsDir)) {
 }
 app.use('/category-icons', express.static(categoryIconsDir));
 
+// Simple admin auth middleware for protected admin endpoints (moved up for initialization order)
+function verifyAdmin(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+    const validToken = process.env.ADMIN_TOKEN || 'admin-auth-token';
+    if (token && token === validToken) {
+      return next();
+    }
+    return res.status(401).json({ error: 'Unauthorized' });
+  } catch (e) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+}
+
 // 7️⃣ Health check (Railway ping)
 app.get("/", (req, res) => {
   res.json({ status: "Backend is running ✅" });
