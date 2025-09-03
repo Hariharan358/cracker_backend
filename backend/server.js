@@ -89,6 +89,14 @@ app.use('/api/admin', rateLimit({
   legacyHeaders: false,
 }));
 
+// Specific higher-limit for discount application (admin-only)
+const discountLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // 6️⃣ JSON body parsing
 app.use(express.json());
 
@@ -197,6 +205,35 @@ app.post('/api/uploads/category-icon', uploadCategoryIcon.single('icon'), async 
   } catch (err) {
     console.error('❌ Category icon upload error:', err);
     res.status(500).json({ error: 'Failed to upload category icon' });
+  }
+});
+
+// Cloudinary storage for category icons
+const categoryIconCloudStorage = new CloudinaryStorage({
+  cloudinary,
+  params: {
+    folder: 'category-icons',
+    allowed_formats: ['jpg', 'jpeg', 'png'],
+    public_id: (req, file) => `${Date.now()}-${file.originalname}`
+  }
+});
+const uploadCategoryIconCloud = multer({ storage: categoryIconCloudStorage });
+
+// ✅ POST: Upload Category Icon (Cloudinary)
+app.post('/api/uploads/category-icon-cloud', uploadCategoryIconCloud.single('icon'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Icon file is required (field name: icon)' });
+    }
+    // CloudinaryStorage places secure_url in req.file.path (multer-storage-cloudinary sets path)
+    const url = req.file.path;
+    return res.json({
+      message: '✅ Category icon uploaded to Cloudinary',
+      url
+    });
+  } catch (err) {
+    console.error('❌ Cloudinary category icon upload error:', err);
+    res.status(500).json({ error: 'Failed to upload category icon to Cloudinary' });
   }
 });
 
@@ -483,7 +520,7 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
 
 
 // ✅ BULK DISCOUNT: Apply discount to all products in all categories
-app.post('/api/products/apply-discount', async (req, res) => {
+app.post('/api/products/apply-discount', verifyAdmin, discountLimiter, async (req, res) => {
   try {
     const { discount } = req.body;
     if (typeof discount !== 'number' || discount < 0 || discount > 100) {
@@ -1185,6 +1222,13 @@ app.post('/api/categories', async (req, res) => {
     
     await newCategory.save();
     console.log(`✅ New category added to database: ${trimmedName}`);
+    // Prepare underlying collection by ensuring the model exists (lazy creation on first use)
+    try {
+      const ProductModel = getProductModelByCategory(trimmedName);
+      await ProductModel.init();
+    } catch (e) {
+      console.warn('⚠️ Could not pre-initialize product collection for category:', trimmedName, e.message);
+    }
     
     // Clear category caches to ensure frontend gets fresh data
     console.log('🔄 Clearing category caches after creation...');
