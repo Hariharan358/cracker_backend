@@ -92,6 +92,13 @@ app.use('/api/admin', rateLimit({
 // 6️⃣ JSON body parsing
 app.use(express.json());
 
+// Static folder for locally stored category icons (Option A)
+const categoryIconsDir = path.join(__dirname, 'public', 'category-icons');
+if (!fs.existsSync(categoryIconsDir)) {
+  fs.mkdirSync(categoryIconsDir, { recursive: true });
+}
+app.use('/category-icons', express.static(categoryIconsDir));
+
 // 7️⃣ Health check (Railway ping)
 app.get("/", (req, res) => {
   res.json({ status: "Backend is running ✅" });
@@ -160,6 +167,38 @@ const storage = new CloudinaryStorage({
   }
 });
 const upload = multer({ storage });
+
+// Multer disk storage for category icons (local filesystem)
+const categoryIconDiskStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, categoryIconsDir),
+  filename: (req, file, cb) => {
+    const safeName = `${Date.now()}-${file.originalname.replace(/\s+/g, '_')}`;
+    cb(null, safeName);
+  }
+});
+const uploadCategoryIcon = multer({ storage: categoryIconDiskStorage });
+
+// ✅ POST: Upload Category Icon (local filesystem)
+app.post('/api/uploads/category-icon', uploadCategoryIcon.single('icon'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Icon file is required (field name: icon)' });
+    }
+    // Build public URL
+    const filename = req.file.filename;
+    const publicPath = `/category-icons/${filename}`;
+    const absoluteUrl = `${req.protocol}://${req.get('host')}${publicPath}`;
+    return res.json({
+      message: '✅ Category icon uploaded',
+      url: absoluteUrl,
+      path: publicPath,
+      filename
+    });
+  } catch (err) {
+    console.error('❌ Category icon upload error:', err);
+    res.status(500).json({ error: 'Failed to upload category icon' });
+  }
+});
 
 
 
@@ -335,6 +374,9 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
     const { id } = req.params;
     let { name_en, name_ta, price, original_price, category, youtube_url, imageUrl } = req.body;
 
+    console.log('🔄 Product update request:', { id, name_en, name_ta, price, original_price, category, youtube_url, imageUrl });
+    console.log('🔄 File uploaded:', req.file);
+
     // Coerce numerics if present
     if (price !== undefined) price = Number(price);
     if (original_price !== undefined && original_price !== '') original_price = Number(original_price);
@@ -342,30 +384,50 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
 
     // Determine final image URL (prefer uploaded file)
     const finalImageUrl = req.file?.path || imageUrl;
+    console.log('🔄 Final image URL:', finalImageUrl);
 
     // Find the product across all category collections
     const collections = await mongoose.connection.db.listCollections().toArray();
+    console.log('🔄 Available collections:', collections.map(c => c.name));
+    
     let foundDoc = null;
     let foundCollectionName = null;
+    
     for (const col of collections) {
       const modelName = col.name;
       if (!/^[A-Z0-9_]+$/.test(modelName)) continue;
+      
+      console.log('🔍 Searching in collection:', modelName);
       const Model = getProductModelByCategory(modelName.replace(/_/g, ' '));
-      const doc = await Model.findById(id);
-      if (doc) {
-        foundDoc = doc;
-        foundCollectionName = modelName;
-        break;
+      
+      try {
+        const doc = await Model.findById(id);
+        if (doc) {
+          foundDoc = doc;
+          foundCollectionName = modelName;
+          console.log('✅ Product found in collection:', modelName);
+          console.log('✅ Found product:', { _id: doc._id, name_en: doc.name_en, category: doc.category });
+          break;
+        }
+      } catch (searchError) {
+        console.log('⚠️ Error searching in collection:', modelName, searchError.message);
       }
     }
 
     if (!foundDoc) {
+      console.log('❌ Product not found in any collection. ID:', id);
+      console.log('❌ Searched collections:', collections.filter(c => /^[A-Z0-9_]+$/.test(c.name)).map(c => c.name));
       return res.status(404).json({ error: 'Product not found' });
     }
+
+    console.log('🔄 Processing update for product:', foundDoc._id);
+    console.log('🔄 Current category:', foundDoc.category);
+    console.log('🔄 New category:', category);
 
     // If category is changing, move document to new collection
     const isCategoryChange = category && foundDoc.category !== category;
     if (isCategoryChange) {
+      console.log('🔄 Category change detected, moving product...');
       // Create in new category collection
       const NewModel = getProductModelByCategory(category);
       const newPayload = {
@@ -379,14 +441,17 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
         createdAt: foundDoc.createdAt,
         updatedAt: new Date(),
       };
+      console.log('🔄 Creating new product in category:', category);
       const created = await NewModel.create(newPayload);
       // Delete old document
       const OldModel = getProductModelByCategory(foundCollectionName.replace(/_/g, ' '));
       await OldModel.findByIdAndDelete(foundDoc._id);
       // Invalidate caches
       clearCacheByPrefix('products:');
+      console.log('✅ Product moved to new category successfully');
       return res.json({ message: '✅ Product updated and moved to new category', product: created });
     } else {
+      console.log('🔄 In-place update...');
       // In-place update
       const updateFields = {};
       if (name_en !== undefined) updateFields.name_en = name_en;
@@ -397,10 +462,13 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
       if (youtube_url !== undefined) updateFields.youtube_url = youtube_url;
       if (category !== undefined) updateFields.category = category;
 
+      console.log('🔄 Update fields:', updateFields);
+
       const Model = getProductModelByCategory(foundCollectionName.replace(/_/g, ' '));
       const updated = await Model.findByIdAndUpdate(foundDoc._id, { $set: updateFields }, { new: true });
       // Invalidate caches
       clearCacheByPrefix('products:');
+      console.log('✅ Product updated successfully');
       return res.json({ message: '✅ Product updated successfully', product: updated });
     }
   } catch (error) {
@@ -1091,7 +1159,7 @@ app.get('/api/categories', async (req, res) => {
 // POST: Add new category
 app.post('/api/categories', async (req, res) => {
   try {
-    const { name } = req.body;
+    const { name, displayName_en, displayName_ta, iconUrl } = req.body;
     
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return res.status(400).json({ error: 'Category name is required and must be a non-empty string' });
@@ -1108,12 +1176,36 @@ app.post('/api/categories', async (req, res) => {
     // Create new category in database
     const newCategory = new Category({
       name: trimmedName,
-      displayName: name.trim(),
+      displayName: displayName_en ? displayName_en.trim() : name.trim(),
+      displayName_en: displayName_en ? displayName_en.trim() : name.trim(),
+      displayName_ta: displayName_ta ? displayName_ta.trim() : '',
+      iconUrl: typeof iconUrl === 'string' ? iconUrl.trim() : '',
       isActive: true
     });
     
     await newCategory.save();
     console.log(`✅ New category added to database: ${trimmedName}`);
+    
+    // Clear category caches to ensure frontend gets fresh data
+    console.log('🔄 Clearing category caches after creation...');
+    try {
+      // Try multiple cache clearing methods
+      if (apicache.clearRegexp) {
+        const cleared = apicache.clearRegexp(/\/api\/categories/);
+        console.log('✅ API cache cleared with regexp:', cleared);
+      } else if (apicache.clear) {
+        apicache.clear();
+        console.log('✅ API cache cleared completely');
+      } else {
+        console.log('⚠️ No apicache clearing method available');
+      }
+      
+      // Also clear our custom memory cache
+      clearCacheByPrefix('products:');
+      console.log('✅ Memory cache cleared');
+    } catch (cacheError) {
+      console.error('❌ Cache clearing error:', cacheError);
+    }
     
     res.status(201).json({ 
       message: 'Category added successfully',
@@ -1128,7 +1220,7 @@ app.post('/api/categories', async (req, res) => {
 // ADMIN: Create new category
 app.post('/api/admin/categories', verifyAdmin, async (req, res) => {
   try {
-    const { name, displayName, description } = req.body;
+    const { name, displayName, description, iconUrl } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return res.status(400).json({ error: 'Category name is required and must be a non-empty string' });
@@ -1148,6 +1240,7 @@ app.post('/api/admin/categories', verifyAdmin, async (req, res) => {
       name: normalizedName,
       displayName: humanDisplayName,
       description: typeof description === 'string' ? description : '',
+      iconUrl: typeof iconUrl === 'string' ? iconUrl.trim() : '',
       isActive: true
     });
 
@@ -1199,7 +1292,9 @@ app.post('/api/admin/categories', verifyAdmin, async (req, res) => {
 app.patch('/api/categories/:name', async (req, res) => {
   try {
     const { name } = req.params;
-    const { displayName, displayName_en, displayName_ta } = req.body;
+    const { displayName, displayName_en, displayName_ta, iconUrl } = req.body;
+    
+    console.log('🔄 Category update request:', { name, displayName, displayName_en, displayName_ta, iconUrl });
     
     // Handle both field names for backward compatibility
     const finalDisplayName = displayName || displayName_en;
@@ -1214,7 +1309,29 @@ app.patch('/api/categories/:name', async (req, res) => {
       return res.status(404).json({ error: 'Category not found' });
     }
 
-    await Category.updateOne({ name: decodedName }, { $set: { displayName: finalDisplayName.trim(), updatedAt: new Date() } });
+    console.log('🔍 Existing category:', existing);
+    console.log('🔍 Updating with iconUrl:', iconUrl);
+
+    const updateData = { 
+      displayName: finalDisplayName.trim(), 
+      displayName_en: displayName_en ? displayName_en.trim() : finalDisplayName.trim(),
+      displayName_ta: displayName_ta ? displayName_ta.trim() : '',
+      updatedAt: new Date() 
+    };
+
+    // Only update iconUrl if it's provided and not empty
+    if (iconUrl && typeof iconUrl === 'string' && iconUrl.trim().length > 0) {
+      updateData.iconUrl = iconUrl.trim();
+      console.log('✅ Adding iconUrl to update:', iconUrl.trim());
+    } else {
+      console.log('⚠️ No iconUrl provided or empty');
+    }
+
+    await Category.updateOne({ name: decodedName }, { $set: updateData });
+    
+    // Verify the update
+    const updatedCategory = await Category.findOne({ name: decodedName });
+    console.log('✅ Updated category:', updatedCategory);
     
     // Clear category caches
     console.log('🔄 Clearing category caches after update...');
@@ -1237,7 +1354,12 @@ app.patch('/api/categories/:name', async (req, res) => {
       console.error('❌ Cache clearing error:', cacheError);
     }
     
-    res.json({ message: '✅ Category updated', name: decodedName, displayName: finalDisplayName.trim() });
+    res.json({ 
+      message: '✅ Category updated', 
+      name: decodedName, 
+      displayName: finalDisplayName.trim(),
+      iconUrl: updatedCategory.iconUrl 
+    });
   } catch (error) {
     console.error('❌ Error updating category:', error);
     res.status(500).json({ error: 'Failed to update category' });
@@ -1351,6 +1473,7 @@ app.delete('/api/categories/:name', async (req, res) => {
       
       // Also clear our custom memory cache
       clearCacheByPrefix('products:');
+      clearAllCache(); // Clear all memory cache
       console.log('✅ Memory cache cleared');
     } catch (cacheError) {
       console.error('❌ Cache clearing error:', cacheError);
@@ -1373,7 +1496,7 @@ app.get('/api/categories/public', cache('2 minutes'), async (req, res) => {
   try {
     const categories = await Category.find({ isActive: true })
       .sort({ name: 1 })
-      .select('name displayName')
+      .select('name displayName displayName_en displayName_ta iconUrl')
       .lean();
     
     res.json(categories);
@@ -1399,7 +1522,10 @@ app.get('/api/categories/detailed', cache('3 minutes'), async (req, res) => {
           return {
             name: category.name,
             displayName: category.displayName,
+            displayName_en: category.displayName_en,
+            displayName_ta: category.displayName_ta,
             description: category.description,
+            iconUrl: category.iconUrl,
             productCount: count,
             createdAt: category.createdAt
           };
@@ -1407,7 +1533,10 @@ app.get('/api/categories/detailed', cache('3 minutes'), async (req, res) => {
           return {
             name: category.name,
             displayName: category.displayName,
+            displayName_en: category.displayName_en,
+            displayName_ta: category.displayName_ta,
             description: category.description,
+            iconUrl: category.iconUrl,
             productCount: 0,
             createdAt: category.createdAt
           };
