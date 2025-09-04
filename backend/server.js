@@ -100,6 +100,21 @@ const discountLimiter = rateLimit({
 // 6️⃣ JSON body parsing
 app.use(express.json());
 
+// Simple admin auth middleware for protected admin endpoints (moved up to avoid TDZ)
+const verifyAdmin = (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+    const validToken = process.env.ADMIN_TOKEN || 'admin-auth-token';
+    if (token && token === validToken) {
+      return next();
+    }
+    return res.status(401).json({ error: 'Unauthorized' });
+  } catch (e) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+};
+
 // Static folder for locally stored category icons (Option A)
 const categoryIconsDir = path.join(__dirname, 'public', 'category-icons');
 if (!fs.existsSync(categoryIconsDir)) {
@@ -651,20 +666,7 @@ app.post('/api/admin/login', (req, res) => {
   return res.status(401).json({ success: false, error: 'Invalid credentials' });
 });
 
-// Simple admin auth middleware for protected admin endpoints
-const verifyAdmin = (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
-    const validToken = process.env.ADMIN_TOKEN || 'admin-auth-token';
-    if (token && token === validToken) {
-      return next();
-    }
-    return res.status(401).json({ error: 'Unauthorized' });
-  } catch (e) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-};
+// (removed duplicate verifyAdmin; defined earlier)
 
 // ✅ GET: Analytics
 app.get('/api/analytics', cache('2 minutes'), async (req, res) => {
