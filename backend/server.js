@@ -377,7 +377,7 @@ app.post('/api/products', upload.single('image'), async (req, res) => {
     }
     // Ensure price and original_price are numbers
     price = Number(price);
-    original_price = original_price ? Number(original_price) : undefined;
+    original_price = (original_price !== undefined && original_price !== '') ? Number(original_price) : undefined;
     const ProductModel = getProductModelByCategory(category);
     const newProduct = new ProductModel({ name_en, name_ta, price, original_price, imageUrl: finalImageUrl, youtube_url });
     await newProduct.save();
@@ -569,78 +569,6 @@ app.post('/api/products/apply-discount', verifyAdmin, discountLimiter, async (re
   } catch (error) {
     console.error('❌ Error applying discount:', error);
     res.status(500).json({ error: 'Failed to apply discount to products.' });
-  }
-});
-
-// ✅ PATCH: Set original_price for a single product by ID
-app.patch('/api/products/:id/original-price', verifyAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    let { original_price } = req.body || {};
-    if (original_price === undefined || original_price === null || original_price === '') {
-      return res.status(400).json({ error: 'original_price is required' });
-    }
-    original_price = Number(original_price);
-    if (Number.isNaN(original_price) || original_price < 0) {
-      return res.status(400).json({ error: 'original_price must be a non-negative number' });
-    }
-
-    const collections = await mongoose.connection.db.listCollections().toArray();
-    for (const col of collections) {
-      const modelName = col.name;
-      if (!/^[A-Z0-9_]+$/.test(modelName)) continue;
-      const Model = getProductModelByCategory(modelName.replace(/_/g, ' '));
-      const updated = await Model.findByIdAndUpdate(id, { $set: { original_price } }, { new: true });
-      if (updated) {
-        clearCacheByPrefix('products:');
-        try {
-          if (apicache && typeof apicache.clearRegexp === 'function') {
-            apicache.clearRegexp(/\/api\/products\/(home|category|all)/);
-          } else if (apicache && typeof apicache.clear === 'function') {
-            apicache.clear();
-          }
-        } catch (e) {
-          console.warn('⚠️ Failed to clear apicache after setting original_price:', e.message);
-        }
-        return res.json({ message: '✅ original_price updated', product: updated });
-      }
-    }
-    return res.status(404).json({ error: 'Product not found' });
-  } catch (error) {
-    console.error('❌ Error setting original_price:', error);
-    res.status(500).json({ error: 'Failed to set original_price' });
-  }
-});
-
-// ✅ POST: Backfill original_price for all products missing it (set to current price)
-app.post('/api/products/backfill-original-price', verifyAdmin, async (req, res) => {
-  try {
-    const collections = await mongoose.connection.db.listCollections().toArray();
-    let totalUpdated = 0;
-    for (const col of collections) {
-      const modelName = col.name;
-      if (!/^[A-Z0-9_]+$/.test(modelName)) continue;
-      const Model = getProductModelByCategory(modelName.replace(/_/g, ' '));
-      const result = await Model.updateMany(
-        { $or: [{ original_price: { $exists: false } }, { original_price: null }] },
-        [{ $set: { original_price: '$price' } }]
-      );
-      totalUpdated += result.modifiedCount || 0;
-    }
-    clearCacheByPrefix('products:');
-    try {
-      if (apicache && typeof apicache.clearRegexp === 'function') {
-        apicache.clearRegexp(/\/api\/products\/(home|category|all)/);
-      } else if (apicache && typeof apicache.clear === 'function') {
-        apicache.clear();
-      }
-    } catch (e) {
-      console.warn('⚠️ Failed to clear apicache after backfill:', e.message);
-    }
-    res.json({ message: '✅ Backfill complete', updated: totalUpdated });
-  } catch (error) {
-    console.error('❌ Error backfilling original_price:', error);
-    res.status(500).json({ error: 'Failed to backfill original_price' });
   }
 });
 
@@ -919,7 +847,7 @@ app.get('/api/products/home', cache('3 minutes'), async (req, res) => {
             imageUrl: 1,
             youtube_url: 1,
             category: 1
-          }).limit(6).lean();
+          }).sort({ order: 1, createdAt: -1 }).limit(6).lean();
           
           // Add category name for frontend
           return products.map(product => ({
@@ -990,7 +918,7 @@ app.get('/api/products/category/:category', cache('2 minutes'), async (req, res)
       youtube_url: 1,
       category: 1,
       createdAt: 1,
-    }).lean();
+    }).sort({ order: 1, createdAt: -1 }).lean();
 
     const productsWithCategory = products.map(product => ({
       ...product,
@@ -1034,7 +962,7 @@ app.get('/api/products/all', cache('5 minutes'), async (req, res) => {
             imageUrl: 1,
             youtube_url: 1,
             createdAt: 1,
-          }).lean();
+          }).sort({ order: 1, createdAt: -1 }).lean();
           
           const category = collectionName.replace(/_/g, ' ');
           return docs.map((doc) => ({ ...doc, category }));
@@ -1084,6 +1012,43 @@ app.delete('/api/products/:id', async (req, res) => {
   } catch (error) {
     console.error('❌ Product DELETE error:', error);
     res.status(500).json({ error: 'Failed to delete product' });
+  }
+});
+
+// ✅ POST: Reorder products within a category
+app.post('/api/products/reorder', verifyAdmin, async (req, res) => {
+  try {
+    const { category, order } = req.body || {};
+    if (!category || !Array.isArray(order)) {
+      return res.status(400).json({ error: 'category and order array are required' });
+    }
+    // order: [{ id: string, order: number }]
+    const ProductModel = getProductModelByCategory(category);
+    const bulkOps = order.map(item => ({
+      updateOne: {
+        filter: { _id: new mongoose.Types.ObjectId(item.id) },
+        update: { $set: { order: Number(item.order) || 0 } }
+      }
+    }));
+    if (bulkOps.length === 0) {
+      return res.json({ message: 'No changes' });
+    }
+    const result = await ProductModel.bulkWrite(bulkOps, { ordered: false });
+    // Invalidate caches
+    clearCacheByPrefix('products:');
+    try {
+      if (apicache && typeof apicache.clearRegexp === 'function') {
+        apicache.clearRegexp(/\/api\/products\/(home|category|all)/);
+      } else if (apicache && typeof apicache.clear === 'function') {
+        apicache.clear();
+      }
+    } catch (e) {
+      console.warn('⚠️ Failed to clear apicache after product reorder:', e.message);
+    }
+    return res.json({ message: '✅ Product order updated', result });
+  } catch (error) {
+    console.error('❌ Error reordering products:', error);
+    res.status(500).json({ error: 'Failed to reorder products' });
   }
 });
 
@@ -1221,7 +1186,6 @@ app.get('/api/performance', (req, res) => {
     }
   });
 });
-
 // ✅ Health check endpoint for Railway
 app.get('/health', (req, res) => {
   res.json({
