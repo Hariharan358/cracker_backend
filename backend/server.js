@@ -107,21 +107,6 @@ if (!fs.existsSync(categoryIconsDir)) {
 }
 app.use('/category-icons', express.static(categoryIconsDir));
 
-// Simple admin auth middleware for protected admin endpoints (moved up for initialization order)
-function verifyAdmin(req, res, next) {
-  try {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
-    const validToken = process.env.ADMIN_TOKEN || 'admin-auth-token';
-    if (token && token === validToken) {
-      return next();
-    }
-    return res.status(401).json({ error: 'Unauthorized' });
-  } catch (e) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-}
-
 // 7️⃣ Health check (Railway ping)
 app.get("/", (req, res) => {
   res.json({ status: "Backend is running ✅" });
@@ -220,35 +205,6 @@ app.post('/api/uploads/category-icon', uploadCategoryIcon.single('icon'), async 
   } catch (err) {
     console.error('❌ Category icon upload error:', err);
     res.status(500).json({ error: 'Failed to upload category icon' });
-  }
-});
-
-// Cloudinary storage for category icons
-const categoryIconCloudStorage = new CloudinaryStorage({
-  cloudinary,
-  params: {
-    folder: 'category-icons',
-    allowed_formats: ['jpg', 'jpeg', 'png'],
-    public_id: (req, file) => `${Date.now()}-${file.originalname}`
-  }
-});
-const uploadCategoryIconCloud = multer({ storage: categoryIconCloudStorage });
-
-// ✅ POST: Upload Category Icon (Cloudinary)
-app.post('/api/uploads/category-icon-cloud', uploadCategoryIconCloud.single('icon'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'Icon file is required (field name: icon)' });
-    }
-    // CloudinaryStorage places secure_url in req.file.path (multer-storage-cloudinary sets path)
-    const url = req.file.path;
-    return res.json({
-      message: '✅ Category icon uploaded to Cloudinary',
-      url
-    });
-  } catch (err) {
-    console.error('❌ Cloudinary category icon upload error:', err);
-    res.status(500).json({ error: 'Failed to upload category icon to Cloudinary' });
   }
 });
 
@@ -695,7 +651,20 @@ app.post('/api/admin/login', (req, res) => {
   return res.status(401).json({ success: false, error: 'Invalid credentials' });
 });
 
-// (verifyAdmin defined earlier)
+// Simple admin auth middleware for protected admin endpoints
+const verifyAdmin = (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+    const validToken = process.env.ADMIN_TOKEN || 'admin-auth-token';
+    if (token && token === validToken) {
+      return next();
+    }
+    return res.status(401).json({ error: 'Unauthorized' });
+  } catch (e) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+};
 
 // ✅ GET: Analytics
 app.get('/api/analytics', cache('2 minutes'), async (req, res) => {
@@ -1181,7 +1150,7 @@ app.get('/api/test-cors', (req, res) => {
 app.get('/api/categories', async (req, res) => {
   try {
     const categories = await Category.find({ isActive: true })
-      .sort({ name: 1 })
+      .sort({ order: 1, name: 1 })
       .select('name displayName description isActive createdAt')
       .lean();
     
@@ -1192,6 +1161,30 @@ app.get('/api/categories', async (req, res) => {
   } catch (error) {
     console.error('❌ Error fetching categories:', error);
     res.status(500).json({ error: 'Failed to fetch categories' });
+  }
+});
+
+// ✅ BULK REORDER: Update order for multiple categories
+app.post('/api/categories/reorder', verifyAdmin, async (req, res) => {
+  try {
+    const { order } = req.body; // [{ name, order }, ...]
+    if (!Array.isArray(order)) {
+      return res.status(400).json({ error: 'order must be an array of { name, order }' });
+    }
+    const ops = order
+      .filter(item => item && typeof item.name === 'string' && typeof item.order === 'number')
+      .map(item => ({ updateOne: { filter: { name: item.name }, update: { $set: { order: item.order, updatedAt: new Date() } } } }));
+    if (ops.length === 0) {
+      return res.status(400).json({ error: 'no valid items provided' });
+    }
+    await Category.bulkWrite(ops);
+    // Clear caches so new order reflects immediately
+    if (apicache.clearRegexp) apicache.clearRegexp(/\/api\/categories/);
+    clearAllCache();
+    res.json({ message: '✅ Category order updated', updated: ops.length });
+  } catch (error) {
+    console.error('❌ Reorder categories error:', error);
+    res.status(500).json({ error: 'Failed to reorder categories' });
   }
 });
 
@@ -1212,6 +1205,10 @@ app.post('/api/categories', async (req, res) => {
       return res.status(409).json({ error: 'Category already exists' });
     }
     
+    // Determine next order value
+    const maxOrderDoc = await Category.findOne({}).sort({ order: -1 }).lean();
+    const nextOrder = (maxOrderDoc?.order ?? 0) + 1;
+
     // Create new category in database
     const newCategory = new Category({
       name: trimmedName,
@@ -1219,18 +1216,12 @@ app.post('/api/categories', async (req, res) => {
       displayName_en: displayName_en ? displayName_en.trim() : name.trim(),
       displayName_ta: displayName_ta ? displayName_ta.trim() : '',
       iconUrl: typeof iconUrl === 'string' ? iconUrl.trim() : '',
-      isActive: true
+      isActive: true,
+      order: nextOrder
     });
     
     await newCategory.save();
     console.log(`✅ New category added to database: ${trimmedName}`);
-    // Prepare underlying collection by ensuring the model exists (lazy creation on first use)
-    try {
-      const ProductModel = getProductModelByCategory(trimmedName);
-      await ProductModel.init();
-    } catch (e) {
-      console.warn('⚠️ Could not pre-initialize product collection for category:', trimmedName, e.message);
-    }
     
     // Clear category caches to ensure frontend gets fresh data
     console.log('🔄 Clearing category caches after creation...');
@@ -1282,12 +1273,16 @@ app.post('/api/admin/categories', verifyAdmin, async (req, res) => {
       return res.status(409).json({ error: 'Category already exists' });
     }
 
+    const maxOrderDoc = await Category.findOne({}).sort({ order: -1 }).lean();
+    const nextOrder = (maxOrderDoc?.order ?? 0) + 1;
+
     const newCategory = new Category({
       name: normalizedName,
       displayName: humanDisplayName,
       description: typeof description === 'string' ? description : '',
       iconUrl: typeof iconUrl === 'string' ? iconUrl.trim() : '',
-      isActive: true
+      isActive: true,
+      order: nextOrder
     });
 
     await newCategory.save();
@@ -1338,7 +1333,7 @@ app.post('/api/admin/categories', verifyAdmin, async (req, res) => {
 app.patch('/api/categories/:name', async (req, res) => {
   try {
     const { name } = req.params;
-    const { displayName, displayName_en, displayName_ta, iconUrl, isActive } = req.body;
+    const { displayName, displayName_en, displayName_ta, iconUrl, order } = req.body;
     
     console.log('🔄 Category update request:', { name, displayName, displayName_en, displayName_ta, iconUrl });
     
@@ -1364,6 +1359,9 @@ app.patch('/api/categories/:name', async (req, res) => {
       displayName_ta: displayName_ta ? displayName_ta.trim() : '',
       updatedAt: new Date() 
     };
+    if (typeof order === 'number') {
+      updateData.order = order;
+    }
 
     // Only update iconUrl if it's provided and not empty
     if (iconUrl && typeof iconUrl === 'string' && iconUrl.trim().length > 0) {
@@ -1371,11 +1369,6 @@ app.patch('/api/categories/:name', async (req, res) => {
       console.log('✅ Adding iconUrl to update:', iconUrl.trim());
     } else {
       console.log('⚠️ No iconUrl provided or empty');
-    }
-
-    // Optionally toggle active state if provided
-    if (typeof isActive === 'boolean') {
-      updateData.isActive = isActive;
     }
 
     await Category.updateOne({ name: decodedName }, { $set: updateData });
@@ -1409,8 +1402,7 @@ app.patch('/api/categories/:name', async (req, res) => {
       message: '✅ Category updated', 
       name: decodedName, 
       displayName: finalDisplayName.trim(),
-      iconUrl: updatedCategory.iconUrl,
-      isActive: updatedCategory.isActive
+      iconUrl: updatedCategory.iconUrl 
     });
   } catch (error) {
     console.error('❌ Error updating category:', error);
@@ -1547,7 +1539,7 @@ app.delete('/api/categories/:name', async (req, res) => {
 app.get('/api/categories/public', cache('2 minutes'), async (req, res) => {
   try {
     const categories = await Category.find({ isActive: true })
-      .sort({ name: 1 })
+      .sort({ order: 1, name: 1 })
       .select('name displayName displayName_en displayName_ta iconUrl')
       .lean();
     
@@ -1562,7 +1554,7 @@ app.get('/api/categories/public', cache('2 minutes'), async (req, res) => {
 app.get('/api/categories/detailed', cache('3 minutes'), async (req, res) => {
   try {
     const categories = await Category.find({ isActive: true })
-      .sort({ name: 1 })
+      .sort({ order: 1, name: 1 })
       .lean();
     
     // Get product counts for each category
@@ -1578,6 +1570,7 @@ app.get('/api/categories/detailed', cache('3 minutes'), async (req, res) => {
             displayName_ta: category.displayName_ta,
             description: category.description,
             iconUrl: category.iconUrl,
+            order: category.order,
             productCount: count,
             createdAt: category.createdAt
           };
@@ -1589,6 +1582,7 @@ app.get('/api/categories/detailed', cache('3 minutes'), async (req, res) => {
             displayName_ta: category.displayName_ta,
             description: category.description,
             iconUrl: category.iconUrl,
+            order: category.order,
             productCount: 0,
             createdAt: category.createdAt
           };
