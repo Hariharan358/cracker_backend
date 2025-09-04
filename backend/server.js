@@ -383,6 +383,16 @@ app.post('/api/products', upload.single('image'), async (req, res) => {
     await newProduct.save();
     // Invalidate product caches
     clearCacheByPrefix('products:');
+    // Also clear HTTP apicache for product endpoints so frontend sees updates immediately
+    try {
+      if (apicache && typeof apicache.clearRegexp === 'function') {
+        apicache.clearRegexp(/\/api\/products\/(home|category|all)/);
+      } else if (apicache && typeof apicache.clear === 'function') {
+        apicache.clear();
+      }
+    } catch (e) {
+      console.warn('⚠️ Failed to clear apicache after product add:', e.message);
+    }
     res.status(201).json({ message: '✅ Product added successfully', product: newProduct });
   } catch (error) {
     console.error('❌ Product POST error:', error);
@@ -471,6 +481,16 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
       await OldModel.findByIdAndDelete(foundDoc._id);
       // Invalidate caches
       clearCacheByPrefix('products:');
+      // Also clear HTTP apicache for product endpoints
+      try {
+        if (apicache && typeof apicache.clearRegexp === 'function') {
+          apicache.clearRegexp(/\/api\/products\/(home|category|all)/);
+        } else if (apicache && typeof apicache.clear === 'function') {
+          apicache.clear();
+        }
+      } catch (e) {
+        console.warn('⚠️ Failed to clear apicache after product move:', e.message);
+      }
       console.log('✅ Product moved to new category successfully');
       return res.json({ message: '✅ Product updated and moved to new category', product: created });
     } else {
@@ -491,6 +511,16 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
       const updated = await Model.findByIdAndUpdate(foundDoc._id, { $set: updateFields }, { new: true });
       // Invalidate caches
       clearCacheByPrefix('products:');
+      // Also clear HTTP apicache for product endpoints
+      try {
+        if (apicache && typeof apicache.clearRegexp === 'function') {
+          apicache.clearRegexp(/\/api\/products\/(home|category|all)/);
+        } else if (apicache && typeof apicache.clear === 'function') {
+          apicache.clear();
+        }
+      } catch (e) {
+        console.warn('⚠️ Failed to clear apicache after product update:', e.message);
+      }
       console.log('✅ Product updated successfully');
       return res.json({ message: '✅ Product updated successfully', product: updated });
     }
