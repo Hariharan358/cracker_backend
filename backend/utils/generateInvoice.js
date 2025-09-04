@@ -23,7 +23,7 @@ export function generateInvoice(order, outputPath) {
 
   doc.moveDown();
   doc.text(`Total Amount: ₹${order.total}`, { bold: true });
-  doc.text("Payment Mode: Cash on Delivery");
+  
   doc.text("Status: " + order.status);
 
   doc.end();
