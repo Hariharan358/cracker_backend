@@ -14,9 +14,28 @@ const categorySchema = new mongoose.Schema({
     required: true,
     trim: true
   },
+  displayName_en: { 
+    type: String, 
+    trim: true
+  },
+  displayName_ta: { 
+    type: String, 
+    trim: true
+  },
+  // Optional icon image URL for showing category icon in UI
+  iconUrl: {
+    type: String,
+    default: ''
+  },
   description: { 
     type: String, 
     default: '' 
+  },
+  // Display order for custom sorting in UI
+  order: {
+    type: Number,
+    default: 0,
+    index: true
   },
   isActive: { 
     type: Boolean, 
