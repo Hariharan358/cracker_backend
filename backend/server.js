@@ -572,6 +572,78 @@ app.post('/api/products/apply-discount', verifyAdmin, discountLimiter, async (re
   }
 });
 
+// ✅ PATCH: Set original_price for a single product by ID
+app.patch('/api/products/:id/original-price', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    let { original_price } = req.body || {};
+    if (original_price === undefined || original_price === null || original_price === '') {
+      return res.status(400).json({ error: 'original_price is required' });
+    }
+    original_price = Number(original_price);
+    if (Number.isNaN(original_price) || original_price < 0) {
+      return res.status(400).json({ error: 'original_price must be a non-negative number' });
+    }
+
+    const collections = await mongoose.connection.db.listCollections().toArray();
+    for (const col of collections) {
+      const modelName = col.name;
+      if (!/^[A-Z0-9_]+$/.test(modelName)) continue;
+      const Model = getProductModelByCategory(modelName.replace(/_/g, ' '));
+      const updated = await Model.findByIdAndUpdate(id, { $set: { original_price } }, { new: true });
+      if (updated) {
+        clearCacheByPrefix('products:');
+        try {
+          if (apicache && typeof apicache.clearRegexp === 'function') {
+            apicache.clearRegexp(/\/api\/products\/(home|category|all)/);
+          } else if (apicache && typeof apicache.clear === 'function') {
+            apicache.clear();
+          }
+        } catch (e) {
+          console.warn('⚠️ Failed to clear apicache after setting original_price:', e.message);
+        }
+        return res.json({ message: '✅ original_price updated', product: updated });
+      }
+    }
+    return res.status(404).json({ error: 'Product not found' });
+  } catch (error) {
+    console.error('❌ Error setting original_price:', error);
+    res.status(500).json({ error: 'Failed to set original_price' });
+  }
+});
+
+// ✅ POST: Backfill original_price for all products missing it (set to current price)
+app.post('/api/products/backfill-original-price', verifyAdmin, async (req, res) => {
+  try {
+    const collections = await mongoose.connection.db.listCollections().toArray();
+    let totalUpdated = 0;
+    for (const col of collections) {
+      const modelName = col.name;
+      if (!/^[A-Z0-9_]+$/.test(modelName)) continue;
+      const Model = getProductModelByCategory(modelName.replace(/_/g, ' '));
+      const result = await Model.updateMany(
+        { $or: [{ original_price: { $exists: false } }, { original_price: null }] },
+        [{ $set: { original_price: '$price' } }]
+      );
+      totalUpdated += result.modifiedCount || 0;
+    }
+    clearCacheByPrefix('products:');
+    try {
+      if (apicache && typeof apicache.clearRegexp === 'function') {
+        apicache.clearRegexp(/\/api\/products\/(home|category|all)/);
+      } else if (apicache && typeof apicache.clear === 'function') {
+        apicache.clear();
+      }
+    } catch (e) {
+      console.warn('⚠️ Failed to clear apicache after backfill:', e.message);
+    }
+    res.json({ message: '✅ Backfill complete', updated: totalUpdated });
+  } catch (error) {
+    console.error('❌ Error backfilling original_price:', error);
+    res.status(500).json({ error: 'Failed to backfill original_price' });
+  }
+});
+
 // Initialize Firebase Admin
 let firebaseApp;
 try {
