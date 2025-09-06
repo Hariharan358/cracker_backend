@@ -11,7 +11,7 @@ import { fileURLToPath } from 'url';
 import { v2 as cloudinary } from 'cloudinary';
 import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import PDFDocument from 'pdfkit';
-import nodemailer from 'nodemailer';
+
 import { Order } from './models/order.model.js';
 import { getProductModelByCategory } from './models/getProductModelByCategory.js';
 import { Category } from './models/category.model.js';
