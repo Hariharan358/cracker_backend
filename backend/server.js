@@ -11,7 +11,7 @@ import { fileURLToPath } from 'url';
 import { v2 as cloudinary } from 'cloudinary';
 import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import PDFDocument from 'pdfkit';
-
+import nodemailer from 'nodemailer';
 import { Order } from './models/order.model.js';
 import { getProductModelByCategory } from './models/getProductModelByCategory.js';
 import { Category } from './models/category.model.js';
@@ -707,7 +707,44 @@ app.post('/api/orders', async (req, res) => {
   try {
     const orderId = await createOrderSimple(req.body);
     console.log('✅ Order saved successfully (fallback):', orderId);
-    res.status(201).json({ message: '✅ Order placed successfully', orderId });
+
+    // Generate invoice PDF and send email
+    try {
+      const invoiceDir = path.join(__dirname, 'invoices');
+      if (!fs.existsSync(invoiceDir)) fs.mkdirSync(invoiceDir, { recursive: true });
+      const invoicePath = path.join(invoiceDir, `${orderId}.pdf`);
+      const orderDoc = await Order.findOne({ orderId }).lean();
+      if (orderDoc) {
+        generateInvoice(orderDoc, invoicePath);
+      }
+      // Send email if configured and email present
+      let emailStatus = 'not_configured';
+      const to = orderDoc?.customerDetails?.email;
+      if (to && process.env.EMAIL_FROM && process.env.EMAIL_PASS) {
+        try {
+          const transporter = nodemailer.createTransporter({
+            service: 'gmail',
+            auth: { user: process.env.EMAIL_FROM, pass: process.env.EMAIL_PASS },
+          });
+          await transporter.verify();
+          await transporter.sendMail({
+            from: `KMPyrotech <${process.env.EMAIL_FROM}>`,
+            to,
+            subject: 'KMPyrotech - Your Order Invoice',
+            text: 'Thank you for your order! Your invoice is attached.',
+            attachments: [{ filename: 'invoice.pdf', path: invoicePath }],
+          });
+          emailStatus = 'sent';
+        } catch (mailErr) {
+          console.warn('Email send failed:', mailErr.message);
+          emailStatus = 'failed';
+        }
+      }
+      res.status(201).json({ message: '✅ Order placed successfully', orderId, emailStatus });
+    } catch (invErr) {
+      console.warn('Invoice/email step failed:', invErr.message);
+      res.status(201).json({ message: '✅ Order placed successfully', orderId, emailStatus: 'skipped' });
+    }
   } catch (error) {
     const status = error.statusCode || 500;
     console.error('❌ Fallback order placement error:', error);
