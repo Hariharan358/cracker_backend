@@ -11,7 +11,7 @@ import { fileURLToPath } from 'url';
 import { v2 as cloudinary } from 'cloudinary';
 import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import PDFDocument from 'pdfkit';
-
+import nodemailer from 'nodemailer';
 import { Order } from './models/order.model.js';
 import { getProductModelByCategory } from './models/getProductModelByCategory.js';
 import { Category } from './models/category.model.js';
@@ -347,6 +347,47 @@ app.get('/api/orders', async (req, res) => {
   } catch (error) {
     console.error("❌ Error fetching orders:", error);
     res.status(500).json({ error: "Failed to fetch orders" });
+  }
+});
+
+// ✅ GET: Download invoice PDF
+app.get('/api/orders/:orderId/invoice', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    
+    // Verify order exists
+    const order = await Order.findOne({ orderId }).lean();
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    // Check if invoice file exists
+    const invoicePath = path.join(__dirname, 'invoices', `${orderId}.pdf`);
+    if (!fs.existsSync(invoicePath)) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    // Set headers for PDF download
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="KM_Pyrotech_Invoice_${orderId}.pdf"`);
+    
+    // Stream the file
+    const fileStream = fs.createReadStream(invoicePath);
+    fileStream.pipe(res);
+    
+    fileStream.on('error', (error) => {
+      console.error('❌ Error streaming invoice:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to download invoice' });
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error downloading invoice:', error);
+    res.status(500).json({ 
+      error: 'Failed to download invoice', 
+      details: error.message 
+    });
   }
 });
 
@@ -714,35 +755,45 @@ app.post('/api/orders', async (req, res) => {
       if (!fs.existsSync(invoiceDir)) fs.mkdirSync(invoiceDir, { recursive: true });
       const invoicePath = path.join(invoiceDir, `${orderId}.pdf`);
       const orderDoc = await Order.findOne({ orderId }).lean();
-      if (orderDoc) {
-        generateInvoice(orderDoc, invoicePath);
-      }
-      // Send email if configured and email present
+      
       let emailStatus = 'not_configured';
-      const to = orderDoc?.customerDetails?.email;
-      if (to && process.env.EMAIL_FROM && process.env.EMAIL_PASS) {
-        try {
-          const transporter = nodemailer.createTransporter({
-            service: 'gmail',
-            auth: { user: process.env.EMAIL_FROM, pass: process.env.EMAIL_PASS },
-          });
-          await transporter.verify();
-          await transporter.sendMail({
-            from: `KMPyrotech <${process.env.EMAIL_FROM}>`,
-            to,
-            subject: 'KMPyrotech - Your Order Invoice',
-            text: 'Thank you for your order! Your invoice is attached.',
-            attachments: [{ filename: 'invoice.pdf', path: invoicePath }],
-          });
-          emailStatus = 'sent';
-        } catch (mailErr) {
-          console.warn('Email send failed:', mailErr.message);
-          emailStatus = 'failed';
+      if (orderDoc) {
+        // Generate invoice PDF first
+        await new Promise((resolve, reject) => {
+          generateInvoice(orderDoc, invoicePath);
+          // Wait a bit for file to be written
+          setTimeout(resolve, 1000);
+        });
+        
+        // Send email if configured and email present
+        const to = orderDoc?.customerDetails?.email;
+        if (to && process.env.EMAIL_FROM && process.env.EMAIL_PASS) {
+          try {
+            const transporter = nodemailer.createTransporter({
+              service: 'gmail',
+              auth: { user: process.env.EMAIL_FROM, pass: process.env.EMAIL_PASS },
+            });
+            await transporter.verify();
+            await transporter.sendMail({
+              from: `KMPyrotech <${process.env.EMAIL_FROM}>`,
+              to,
+              subject: 'KMPyrotech - Your Order Invoice',
+              text: 'Thank you for your order! Your invoice is attached.',
+              attachments: [{ filename: 'invoice.pdf', path: invoicePath }],
+            });
+            emailStatus = 'sent';
+            console.log('✅ Email sent successfully to:', to);
+          } catch (mailErr) {
+            console.warn('❌ Email send failed:', mailErr.message);
+            emailStatus = 'failed';
+          }
+        } else {
+          console.log('❌ Email not configured or missing email address');
         }
       }
       res.status(201).json({ message: '✅ Order placed successfully', orderId, emailStatus });
     } catch (invErr) {
-      console.warn('Invoice/email step failed:', invErr.message);
+      console.warn('❌ Invoice/email step failed:', invErr.message);
       res.status(201).json({ message: '✅ Order placed successfully', orderId, emailStatus: 'skipped' });
     }
   } catch (error) {
