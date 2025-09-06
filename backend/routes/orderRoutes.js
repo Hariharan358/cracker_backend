@@ -143,21 +143,95 @@ function generateInvoice(order, filePath) {
   doc.end();
 }
 
-async function sendEmailWithInvoice(to, filePath) {
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: process.env.EMAIL_FROM,
-      pass: process.env.EMAIL_PASS,
-    },
-  });
-  await transporter.sendMail({
-    from: `"KMPyrotech" <${process.env.EMAIL_FROM}>`,
-    to,
-    subject: 'KMPyrotech - Your Order Invoice',
-    text: 'Thank you for your order! Please find your invoice attached.',
-    attachments: [{ filename: 'invoice.pdf', path: filePath }],
-  });
+export async function sendEmailWithInvoice(to, filePath) {
+  try {
+    console.log('📧 Attempting to send email to:', to);
+    console.log('📧 Email configuration check:');
+    console.log('  - EMAIL_FROM:', process.env.EMAIL_FROM ? 'Set' : 'Not set');
+    console.log('  - EMAIL_PASS:', process.env.EMAIL_PASS ? 'Set' : 'Not set');
+    
+    if (!process.env.EMAIL_FROM || !process.env.EMAIL_PASS) {
+      throw new Error('Email configuration missing. Please set EMAIL_FROM and EMAIL_PASS environment variables.');
+    }
+
+    // Check if invoice file exists
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Invoice file not found: ${filePath}`);
+    }
+
+    let transporter;
+    
+    // Try OAuth2 first if credentials are available
+    if (process.env.EMAIL_CLIENT_ID && process.env.EMAIL_CLIENT_SECRET && process.env.EMAIL_REFRESH_TOKEN) {
+      console.log('🔐 Using OAuth2 authentication');
+      transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          type: 'OAuth2',
+          user: process.env.EMAIL_FROM,
+          clientId: process.env.EMAIL_CLIENT_ID,
+          clientSecret: process.env.EMAIL_CLIENT_SECRET,
+          refreshToken: process.env.EMAIL_REFRESH_TOKEN,
+        },
+      });
+    } else {
+      console.log('🔐 Using App Password authentication');
+      transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          user: process.env.EMAIL_FROM,
+          pass: process.env.EMAIL_PASS,
+        },
+      });
+    }
+
+    // Verify transporter configuration
+    await transporter.verify();
+    console.log('✅ Email transporter verified successfully');
+
+    const mailOptions = {
+      from: `"KMPyrotech" <${process.env.EMAIL_FROM}>`,
+      to: to,
+      subject: 'KMPyrotech - Your Order Invoice',
+      text: 'Thank you for your order! Please find your invoice attached.',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2 style="color: #16a34a;">Thank you for your order!</h2>
+          <p>Dear Customer,</p>
+          <p>Your order has been successfully placed. Please find your invoice attached to this email.</p>
+          <p>If you have any questions, please don't hesitate to contact us.</p>
+          <br>
+          <p>Best regards,<br>KMPyrotech Team</p>
+        </div>
+      `,
+      attachments: [{ 
+        filename: 'invoice.pdf', 
+        path: filePath 
+      }],
+    };
+
+    const result = await transporter.sendMail(mailOptions);
+    console.log('✅ Email sent successfully:', result.messageId);
+    return result;
+    
+  } catch (error) {
+    console.error('❌ Email sending failed:', error.message);
+    
+    // Provide specific error messages for common issues
+    if (error.code === 'EAUTH') {
+      console.error('🔐 Authentication failed. Please check your email credentials.');
+      console.error('💡 For Gmail, make sure to:');
+      console.error('   1. Enable 2-Factor Authentication');
+      console.error('   2. Generate an App Password');
+      console.error('   3. Use the App Password as EMAIL_PASS');
+    } else if (error.code === 'ECONNECTION') {
+      console.error('🌐 Connection failed. Please check your internet connection.');
+    } else if (error.code === 'ETIMEDOUT') {
+      console.error('⏰ Connection timed out. Please try again.');
+    }
+    
+    throw error;
+  }
 }
 
 // Place Order Route
@@ -212,25 +286,53 @@ router.post("/place", async (req, res) => {
     
     // Generate invoice (optional - will work without email)
     try {
-      generateInvoice(newOrder, invoicePath);
+      await new Promise((resolve, reject) => {
+        generateInvoice(newOrder, invoicePath);
+        // Wait for PDF generation to complete
+        setTimeout(resolve, 1000);
+      });
       console.log('✅ Invoice generated successfully');
     } catch (invoiceError) {
       console.error('⚠️ Invoice generation failed:', invoiceError);
     }
     
     // Send email with invoice (optional - will work without email config)
+    let emailStatus = 'not_configured';
     try {
-      if (process.env.EMAIL_FROM && process.env.EMAIL_PASS) {
+      console.log('📧 Email sending process started...');
+      console.log('📧 Customer email:', customerDetails.email);
+      console.log('📧 Invoice path:', invoicePath);
+      
+      // Validate email format
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(customerDetails.email)) {
+        console.log('⚠️ Invalid email format:', customerDetails.email);
+        emailStatus = 'invalid_email';
+      } else if (process.env.EMAIL_FROM && process.env.EMAIL_PASS) {
+        console.log('📧 Email configuration found, attempting to send...');
         await sendEmailWithInvoice(customerDetails.email, invoicePath);
-        console.log('✅ Email sent successfully');
+        console.log('✅ Email sent successfully to:', customerDetails.email);
+        emailStatus = 'sent';
       } else {
         console.log('⚠️ Email not sent - missing email configuration');
+        console.log('💡 To enable email sending, set EMAIL_FROM and EMAIL_PASS environment variables');
+        emailStatus = 'not_configured';
       }
     } catch (emailError) {
-      console.error('⚠️ Email sending failed:', emailError);
+      console.error('⚠️ Email sending failed:', emailError.message);
+      console.error('⚠️ Error details:', emailError);
+      emailStatus = 'failed';
     }
     
-    res.status(201).json({ message: '✅ Order placed successfully', orderId });
+    res.status(201).json({ 
+      message: '✅ Order placed successfully', 
+      orderId,
+      emailStatus,
+      emailMessage: emailStatus === 'sent' ? 'Invoice email sent successfully' : 
+                   emailStatus === 'not_configured' ? 'Email not configured' : 
+                   emailStatus === 'invalid_email' ? 'Invalid email format' :
+                   'Email sending failed'
+    });
   } catch (error) {
     console.error('❌ Order placement error:', error);
     res.status(500).json({ 
