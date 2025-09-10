@@ -75,8 +75,12 @@ export function generateInvoice(order, outputPath) {
   doc.font('Helvetica').fontSize(11).fillColor('#222');
   order.items.forEach((item, idx) => {
     const rowY = tableY + 25 + (idx * 20);
-    doc.text(`${idx + 1}.`, boxLeft + 16, rowY);
-    doc.text(`${item.name_en} (${item.name_ta})`, boxLeft + 60, rowY, { width: 200 });
+    doc.text(`${idx + 1}`, boxLeft + 16, rowY);
+    
+    // Use only English name
+    const productName = item.name_en || 'Unknown Product';
+    doc.text(`${productName}`, boxLeft + 60, rowY, { width: 200 });
+    
     doc.text(`${item.quantity}`, boxLeft + 280, rowY);
     doc.text(`₹${item.price}`, boxLeft + 320, rowY);
     doc.text(`₹${item.price * item.quantity}`, boxLeft + 380, rowY);
@@ -100,7 +104,7 @@ export function generateInvoice(order, outputPath) {
   // Thank you note
   doc.moveDown(3);
   doc.fontSize(14).fillColor('#16a34a').font('Helvetica-Bold');
-  doc.text('Thank you for shopping with KM Crackers!', { align: 'center' });
+  doc.text('Thank you for shopping with KM PYROTECH FIREWORKS!', { align: 'center' });
   doc.moveDown(0.5);
   doc.fontSize(12).fillColor('#16a34a');
   doc.text('Wishing you a safe and sparkling festival!', { align: 'center' });
