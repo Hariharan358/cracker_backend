@@ -26,7 +26,8 @@ const generateInvoicePDF = async (order) => {
 
     doc.fontSize(14).text('Products:');
     order.items.forEach((item) => {
-      doc.text(`- ${item.name_en} (${item.name_ta}) × ${item.quantity} @ ₹${item.price} = ₹${item.price * item.quantity}`);
+      const productName = item.name_en || 'Unknown Product';
+      doc.text(`- ${productName} × ${item.quantity} @ ₹${item.price} = ₹${item.price * item.quantity}`);
     });
 
     doc.moveDown();
